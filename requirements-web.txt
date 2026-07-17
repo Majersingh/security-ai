@@ -1,0 +1,6 @@
+# Web UI dependencies (live streaming scan). Includes the core CV stack.
+-r requirements.txt
+
+fastapi>=0.115.0          # web framework (routes + WebSocket)
+uvicorn[standard]>=0.30.0 # ASGI server
+python-multipart>=0.0.9   # multipart/form-data parsing for file uploads

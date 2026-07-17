@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CCTV Operator Monitoring — Live Scan</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7;
+    --green: #3fb950; --red: #f85149; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  input[type=file] { color: var(--muted); font-size: 13px; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 9px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; min-height: 300px;
+           display: flex; align-items: center; justify-content: center; }
+  .stage img { width: 100%; display: block; }
+  .placeholder { color: var(--muted); font-size: 14px; padding: 60px 0; }
+  .scanline { position: absolute; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    animation: sweep 2s linear infinite; display: none; }
+  @keyframes sweep { 0% { top: 0; } 100% { top: 100%; } }
+  .stage.scanning .scanline { display: block; }
+  .bar-wrap { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 14px 0 6px; }
+  .bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--blue)); transition: width .15s; }
+  .statline { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 700; }
+  .badge.live { background: rgba(248,81,73,.15); color: var(--red); }
+  .log-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .count { background: var(--red); color: #fff; border-radius: 10px; padding: 1px 8px; font-size: 12px; font-weight: 700; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 6px 8px; border-bottom: 1px solid #21262d; }
+  .empty { color: var(--muted); padding: 20px 8px; font-size: 13px; }
+  tr.new { animation: flash 1.2s ease-out; }
+  @keyframes flash { from { background: rgba(248,81,73,.35); } to { background: transparent; } }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 10px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+</style>
+</head>
+<body>
+  <h1>CCTV Operator Monitoring — Live Scan</h1>
+  <div class="sub">Upload footage; the AI scans it frame-by-frame and flags mobile-phone usage in real time.</div>
+
+  <div class="controls panel">
+    <input type="file" id="file" accept="video/*" />
+    <button id="scanBtn" disabled>Upload &amp; Scan</button>
+    <span id="status" style="color:var(--muted);font-size:13px;">Choose a video to begin.</span>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="stage" id="stage">
+        <div class="scanline"></div>
+        <div class="placeholder" id="placeholder">Video preview will appear here during scanning.</div>
+        <img id="frame" style="display:none" />
+      </div>
+      <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+      <div class="statline">
+        <span id="progressTxt">0%</span>
+        <span id="frameTxt">frame 0 / 0</span>
+        <span id="tsTxt">00:00:00.000</span>
+      </div>
+      <div class="legend">
+        <span><span class="dot" style="background:#3fb950"></span>Person</span>
+        <span><span class="dot" style="background:#58a6ff"></span>Phone</span>
+        <span><span class="dot" style="background:#f85149"></span>Violation</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="log-head">
+        <strong>Events <span id="liveBadge" class="badge live" style="display:none">● LIVE</span></strong>
+        <span class="count" id="count">0</span>
+      </div>
+      <table>
+        <thead><tr><th>Time</th><th>ID</th><th>Event</th><th>Conf</th></tr></thead>
+        <tbody id="log"><tr><td class="empty" colspan="4">No violations yet.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let selectedFile = null, eventCount = 0;
+
+$("file").addEventListener("change", (e) => {
+  selectedFile = e.target.files[0] || null;
+  $("scanBtn").disabled = !selectedFile;
+  $("status").textContent = selectedFile ? `Ready: ${selectedFile.name}` : "Choose a video to begin.";
+});
+
+$("scanBtn").addEventListener("click", startScan);
+
+async function startScan() {
+  if (!selectedFile) return;
+  $("scanBtn").disabled = true;
+  $("status").textContent = "Uploading…";
+  resetLog();
+
+  const form = new FormData();
+  form.append("file", selectedFile);
+  let job;
+  try {
+    const res = await fetch("/upload", { method: "POST", body: form });
+    job = await res.json();
+  } catch (err) {
+    $("status").textContent = "Upload failed: " + err;
+    $("scanBtn").disabled = false;
+    return;
+  }
+
+  $("status").textContent = "Scanning…";
+  $("stage").classList.add("scanning");
+  $("liveBadge").style.display = "inline-block";
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/${job.job_id}`);
+
+  ws.onmessage = (msg) => {
+    const d = JSON.parse(msg.data);
+    if (d.type === "meta") {
+      $("frameTxt").textContent = `frame 0 / ${d.total_frames}`;
+    } else if (d.type === "frame") {
+      const img = $("frame");
+      img.src = "data:image/jpeg;base64," + d.image;
+      img.style.display = "block";
+      $("placeholder").style.display = "none";
+      $("bar").style.width = d.progress + "%";
+      $("progressTxt").textContent = d.progress + "%";
+      $("frameTxt").textContent = `frame ${d.i + 1} / ${d.total}`;
+      $("tsTxt").textContent = d.timestamp;
+      (d.events || []).forEach(addEventRow);
+    } else if (d.type === "done") {
+      finishScan(`Done — ${d.total_events} violation(s) detected.`);
+    } else if (d.type === "error") {
+      finishScan("Error: " + d.message);
+    }
+  };
+  ws.onerror = () => finishScan("Connection error.");
+  ws.onclose = () => { $("stage").classList.remove("scanning"); $("liveBadge").style.display = "none"; };
+
+  function finishScan(text) {
+    $("status").textContent = text;
+    $("scanBtn").disabled = false;
+    $("stage").classList.remove("scanning");
+    $("liveBadge").style.display = "none";
+  }
+}
+
+function resetLog() {
+  eventCount = 0;
+  $("count").textContent = "0";
+  $("log").innerHTML = '<tr><td class="empty" colspan="4">No violations yet.</td></tr>';
+  $("bar").style.width = "0%"; $("progressTxt").textContent = "0%";
+}
+
+function addEventRow(ev) {
+  if (eventCount === 0) $("log").innerHTML = "";
+  eventCount++;
+  $("count").textContent = eventCount;
+  const tr = document.createElement("tr");
+  tr.className = "new";
+  tr.innerHTML =
+    `<td>${ev.timestamp}</td><td>#${ev.person_id}</td>` +
+    `<td style="color:var(--red);font-weight:600">${ev.event}</td>` +
+    `<td>${Number(ev.confidence).toFixed(2)}</td>`;
+  $("log").prepend(tr);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Model weights (large, auto-downloaded by Ultralytics) ----
+models/*.pt
+models/*.onnx
+models/*.engine
+*.pt
+*.onnx
+*.engine
+
+# ---- Input / uploaded media (large binaries) ----
+input/*.mp4
+input/*.dav
+input/*.avi
+input/*.mov
+input/*.mkv
+uploads/
+
+# ---- Generated outputs ----
+output/annotated*.mp4
+output/*.csv
+output/snapshots/
+
+# ---- Ultralytics / training artifacts ----
+runs/
+*.cache
+
+# ---- Logs ----
+*.log
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,7 @@
+# Core AI / CV stack (pinned to major versions known to interoperate)
+ultralytics>=8.3.0        # YOLOv11 detection + built-in ByteTrack tracking
+lap>=0.5.12               # linear assignment, required by the built-in tracker
+supervision>=0.25,<0.30   # Detections container + annotators (ByteTrack removed in 0.30)
+opencv-python>=4.10.0     # video I/O and drawing
+numpy>=1.26,<2.2          # array math (kept <2.2 for broad wheel compatibility)
+pandas>=2.2.0             # events CSV generation
