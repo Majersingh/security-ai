@@ -20,18 +20,32 @@
   .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; align-items: start; }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+
+  /* mode tabs */
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tab {
+    flex: 1; text-align: center; padding: 12px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--panel); color: var(--muted);
+    cursor: pointer; font-size: 14px; font-weight: 600; user-select: none;
+  }
+  .tab.active { border-color: var(--accent); color: var(--text); background: #1c2333; }
+
   .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
   input[type=file] { color: var(--muted); font-size: 13px; }
   button {
     background: var(--accent); color: #fff; border: 0; border-radius: 6px;
     padding: 9px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
   }
+  button.ghost { background: #21262d; color: var(--text); border: 1px solid var(--border); }
+  button.danger { background: var(--red); }
   button:disabled { opacity: .5; cursor: not-allowed; }
+  .hidden { display: none !important; }
+
   .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; min-height: 300px;
            display: flex; align-items: center; justify-content: center; }
-  .stage img { width: 100%; display: block; }
+  .stage img, .stage video { width: 100%; display: block; }
   .placeholder { color: var(--muted); font-size: 14px; padding: 60px 0; }
-  .scanline { position: absolute; left: 0; right: 0; height: 2px;
+  .scanline { position: absolute; left: 0; right: 0; height: 2px; top: 0;
     background: linear-gradient(90deg, transparent, var(--accent), transparent);
     animation: sweep 2s linear infinite; display: none; }
   @keyframes sweep { 0% { top: 0; } 100% { top: 100%; } }
@@ -55,26 +69,41 @@
 </head>
 <body>
   <h1>CCTV Operator Monitoring — Live Scan</h1>
-  <div class="sub">Upload footage; the AI scans it frame-by-frame and flags mobile-phone usage in real time.</div>
+  <div class="sub">Detect mobile-phone usage in an uploaded video or a live camera feed.</div>
 
-  <div class="controls panel">
+  <div class="tabs">
+    <div class="tab active" id="tabUpload">📁 Upload Video</div>
+    <div class="tab" id="tabCamera">📹 Live Camera</div>
+  </div>
+
+  <!-- Upload controls -->
+  <div class="controls panel" id="uploadControls">
     <input type="file" id="file" accept="video/*" />
     <button id="scanBtn" disabled>Upload &amp; Scan</button>
-    <span id="status" style="color:var(--muted);font-size:13px;">Choose a video to begin.</span>
+    <span id="uploadStatus" style="color:var(--muted);font-size:13px;">Choose a video to begin.</span>
+  </div>
+
+  <!-- Camera controls -->
+  <div class="controls panel hidden" id="cameraControls">
+    <button id="enableCam" class="ghost">Enable Camera</button>
+    <button id="startCam" disabled>Start Scan</button>
+    <button id="stopCam" class="danger hidden">Stop</button>
+    <span id="camStatus" style="color:var(--muted);font-size:13px;">Click “Enable Camera” to grant access.</span>
   </div>
 
   <div class="grid">
     <div class="panel">
       <div class="stage" id="stage">
         <div class="scanline"></div>
-        <div class="placeholder" id="placeholder">Video preview will appear here during scanning.</div>
-        <img id="frame" style="display:none" />
+        <div class="placeholder" id="placeholder">Preview will appear here.</div>
+        <video id="cam" autoplay playsinline muted class="hidden"></video>
+        <img id="frame" class="hidden" />
       </div>
-      <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+      <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
       <div class="statline">
         <span id="progressTxt">0%</span>
-        <span id="frameTxt">frame 0 / 0</span>
-        <span id="tsTxt">00:00:00.000</span>
+        <span id="frameTxt">frame 0</span>
+        <span id="tsTxt">—</span>
       </div>
       <div class="legend">
         <span><span class="dot" style="background:#3fb950"></span>Person</span>
@@ -85,7 +114,7 @@
 
     <div class="panel">
       <div class="log-head">
-        <strong>Events <span id="liveBadge" class="badge live" style="display:none">● LIVE</span></strong>
+        <strong>Events <span id="liveBadge" class="badge live hidden">● LIVE</span></strong>
         <span class="count" id="count">0</span>
       </div>
       <table>
@@ -97,79 +126,39 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let selectedFile = null, eventCount = 0;
+const LIVE_FPS = 6;          // threshold basis for live mode (approx CPU rate)
+let eventCount = 0;
 
-$("file").addEventListener("change", (e) => {
-  selectedFile = e.target.files[0] || null;
-  $("scanBtn").disabled = !selectedFile;
-  $("status").textContent = selectedFile ? `Ready: ${selectedFile.name}` : "Choose a video to begin.";
-});
-
-$("scanBtn").addEventListener("click", startScan);
-
-async function startScan() {
-  if (!selectedFile) return;
-  $("scanBtn").disabled = true;
-  $("status").textContent = "Uploading…";
-  resetLog();
-
-  const form = new FormData();
-  form.append("file", selectedFile);
-  let job;
-  try {
-    const res = await fetch("/upload", { method: "POST", body: form });
-    job = await res.json();
-  } catch (err) {
-    $("status").textContent = "Upload failed: " + err;
-    $("scanBtn").disabled = false;
-    return;
-  }
-
-  $("status").textContent = "Scanning…";
-  $("stage").classList.add("scanning");
-  $("liveBadge").style.display = "inline-block";
-
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${job.job_id}`);
-
-  ws.onmessage = (msg) => {
-    const d = JSON.parse(msg.data);
-    if (d.type === "meta") {
-      $("frameTxt").textContent = `frame 0 / ${d.total_frames}`;
-    } else if (d.type === "frame") {
-      const img = $("frame");
-      img.src = "data:image/jpeg;base64," + d.image;
-      img.style.display = "block";
-      $("placeholder").style.display = "none";
-      $("bar").style.width = d.progress + "%";
-      $("progressTxt").textContent = d.progress + "%";
-      $("frameTxt").textContent = `frame ${d.i + 1} / ${d.total}`;
-      $("tsTxt").textContent = d.timestamp;
-      (d.events || []).forEach(addEventRow);
-    } else if (d.type === "done") {
-      finishScan(`Done — ${d.total_events} violation(s) detected.`);
-    } else if (d.type === "error") {
-      finishScan("Error: " + d.message);
-    }
-  };
-  ws.onerror = () => finishScan("Connection error.");
-  ws.onclose = () => { $("stage").classList.remove("scanning"); $("liveBadge").style.display = "none"; };
-
-  function finishScan(text) {
-    $("status").textContent = text;
-    $("scanBtn").disabled = false;
-    $("stage").classList.remove("scanning");
-    $("liveBadge").style.display = "none";
-  }
+/* ---------------- mode switching ---------------- */
+function setMode(mode) {
+  const upload = mode === "upload";
+  $("tabUpload").classList.toggle("active", upload);
+  $("tabCamera").classList.toggle("active", !upload);
+  $("uploadControls").classList.toggle("hidden", !upload);
+  $("cameraControls").classList.toggle("hidden", upload);
+  $("barWrap").classList.toggle("hidden", !upload);   // no % for live
+  stopCamera();
+  resetView();
 }
+$("tabUpload").onclick = () => setMode("upload");
+$("tabCamera").onclick = () => setMode("camera");
 
+function resetView() {
+  $("frame").classList.add("hidden");
+  $("cam").classList.add("hidden");
+  $("placeholder").classList.remove("hidden");
+  $("stage").classList.remove("scanning");
+  $("liveBadge").classList.add("hidden");
+  resetLog();
+  $("frameTxt").textContent = "frame 0";
+  $("tsTxt").textContent = "—";
+}
 function resetLog() {
   eventCount = 0;
   $("count").textContent = "0";
   $("log").innerHTML = '<tr><td class="empty" colspan="4">No violations yet.</td></tr>';
   $("bar").style.width = "0%"; $("progressTxt").textContent = "0%";
 }
-
 function addEventRow(ev) {
   if (eventCount === 0) $("log").innerHTML = "";
   eventCount++;
@@ -181,6 +170,175 @@ function addEventRow(ev) {
     `<td style="color:var(--red);font-weight:600">${ev.event}</td>` +
     `<td>${Number(ev.confidence).toFixed(2)}</td>`;
   $("log").prepend(tr);
+}
+
+/* ---------------- UPLOAD mode ---------------- */
+let selectedFile = null;
+$("file").addEventListener("change", (e) => {
+  selectedFile = e.target.files[0] || null;
+  $("scanBtn").disabled = !selectedFile;
+  $("uploadStatus").textContent = selectedFile ? `Ready: ${selectedFile.name}` : "Choose a video to begin.";
+});
+$("scanBtn").addEventListener("click", startUploadScan);
+
+async function startUploadScan() {
+  if (!selectedFile) return;
+  $("scanBtn").disabled = true;
+  $("uploadStatus").textContent = "Uploading…";
+  resetView();
+
+  const form = new FormData();
+  form.append("file", selectedFile);
+  let job;
+  try {
+    const res = await fetch("/upload", { method: "POST", body: form });
+    job = await res.json();
+  } catch (err) {
+    $("uploadStatus").textContent = "Upload failed: " + err;
+    $("scanBtn").disabled = false;
+    return;
+  }
+
+  $("uploadStatus").textContent = "Scanning…";
+  $("stage").classList.add("scanning");
+  $("liveBadge").classList.remove("hidden");
+  $("placeholder").classList.add("hidden");
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/${job.job_id}`);
+  ws.onmessage = (msg) => {
+    const d = JSON.parse(msg.data);
+    if (d.type === "meta") {
+      $("frameTxt").textContent = `frame 0 / ${d.total_frames}`;
+    } else if (d.type === "frame") {
+      showFrame(d.image);
+      $("bar").style.width = d.progress + "%";
+      $("progressTxt").textContent = d.progress + "%";
+      $("frameTxt").textContent = `frame ${d.i + 1} / ${d.total}`;
+      $("tsTxt").textContent = d.timestamp;
+      (d.events || []).forEach(addEventRow);
+    } else if (d.type === "done") {
+      endScan(`Done — ${d.total_events} violation(s) detected.`, "uploadStatus");
+    } else if (d.type === "error") {
+      endScan("Error: " + d.message, "uploadStatus");
+    }
+  };
+  ws.onerror = () => endScan("Connection error.", "uploadStatus");
+  ws.onclose = () => { $("stage").classList.remove("scanning"); $("liveBadge").classList.add("hidden"); };
+}
+
+function showFrame(b64) {
+  const img = $("frame");
+  img.src = "data:image/jpeg;base64," + b64;
+  img.classList.remove("hidden");
+  $("cam").classList.add("hidden");
+  $("placeholder").classList.add("hidden");
+}
+function endScan(text, statusId) {
+  $(statusId).textContent = text;
+  $("scanBtn").disabled = false;
+  $("stage").classList.remove("scanning");
+  $("liveBadge").classList.add("hidden");
+}
+
+/* ---------------- CAMERA mode ---------------- */
+let stream = null, camWs = null, scanning = false, liveFrame = 0;
+let fpsTimes = [];
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d");
+
+$("enableCam").onclick = enableCamera;
+$("startCam").onclick = startCameraScan;
+$("stopCam").onclick = stopCamera;
+
+async function enableCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 960 }, audio: false });
+  } catch (err) {
+    $("camStatus").textContent = "Camera access denied or unavailable: " + err.message;
+    return;
+  }
+  const cam = $("cam");
+  cam.srcObject = stream;
+  cam.classList.remove("hidden");
+  $("placeholder").classList.add("hidden");
+  $("frame").classList.add("hidden");
+  cam.onloadedmetadata = () => {
+    canvas.width = cam.videoWidth;
+    canvas.height = cam.videoHeight;
+  };
+  $("startCam").disabled = false;
+  $("startCam").classList.remove("hidden");   // was hidden by stopCamera()/setMode()
+  $("stopCam").classList.add("hidden");
+  $("enableCam").disabled = true;
+  $("camStatus").textContent = "Camera ready. Click “Start Scan”.";
+}
+
+function startCameraScan() {
+  if (!stream) return;
+  resetLog();
+  scanning = true;
+  liveFrame = 0; fpsTimes = [];
+  $("startCam").classList.add("hidden");
+  $("stopCam").classList.remove("hidden");
+  $("camStatus").textContent = "Loading model…";
+  $("stage").classList.add("scanning");
+  $("liveBadge").classList.remove("hidden");
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  camWs = new WebSocket(`${proto}://${location.host}/ws-live`);
+  camWs.onopen = () => camWs.send(JSON.stringify({ type: "init", fps: LIVE_FPS }));
+  camWs.onmessage = (msg) => {
+    const d = JSON.parse(msg.data);
+    if (d.type === "ready") {
+      $("camStatus").textContent = "Scanning live feed…";
+      sendCameraFrame();                 // start the paced loop
+    } else if (d.type === "result") {
+      showFrame(d.image);                // show annotated feed with boxes
+      liveFrame++;
+      updateLiveStats();
+      (d.events || []).forEach(addEventRow);
+      if (scanning) sendCameraFrame();   // request next frame (paced by server)
+    } else if (d.type === "error") {
+      $("camStatus").textContent = "Error: " + d.message;
+      stopCamera();
+    }
+  };
+  camWs.onerror = () => { $("camStatus").textContent = "Connection error."; };
+}
+
+function sendCameraFrame() {
+  if (!scanning || !camWs || camWs.readyState !== WebSocket.OPEN) return;
+  ctx.drawImage($("cam"), 0, 0, canvas.width, canvas.height);
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+  camWs.send(JSON.stringify({ type: "frame", image: dataUrl }));
+}
+
+function updateLiveStats() {
+  const now = performance.now();
+  fpsTimes.push(now);
+  fpsTimes = fpsTimes.filter((t) => now - t < 2000);
+  const fps = fpsTimes.length > 1 ? (fpsTimes.length - 1) / ((now - fpsTimes[0]) / 1000) : 0;
+  $("frameTxt").textContent = `frame ${liveFrame}`;
+  $("tsTxt").textContent = fps.toFixed(1) + " fps";
+}
+
+function stopCamera() {
+  scanning = false;
+  if (camWs && camWs.readyState === WebSocket.OPEN) {
+    try { camWs.send(JSON.stringify({ type: "stop" })); } catch (e) {}
+    camWs.close();
+  }
+  camWs = null;
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  $("cam").srcObject = null;
+  $("startCam").classList.add("hidden");
+  $("stopCam").classList.add("hidden");
+  $("enableCam").disabled = false;
+  $("startCam").disabled = true;
+  $("stage").classList.remove("scanning");
+  $("liveBadge").classList.add("hidden");
+  if ($("camStatus")) $("camStatus").textContent = "Stopped. Click “Enable Camera” to scan again.";
 }
 </script>
 </body>

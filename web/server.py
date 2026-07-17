@@ -22,6 +22,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 # Make the CV package importable.
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,7 +33,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from config import Config  # noqa: E402
-from streaming import StreamingScanner  # noqa: E402
+from streaming import FrameProcessor, StreamingScanner  # noqa: E402
 from utils import format_timestamp, setup_logging  # noqa: E402
 
 logger = setup_logging("INFO")
@@ -80,6 +81,14 @@ def _encode_frame(frame) -> str:
     if not ok:
         return ""
     return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _decode_frame(data_url: str):
+    """Decode a base64 (data-URL or bare) JPEG string into a BGR frame."""
+    b64 = data_url.split(",", 1)[-1]  # strip "data:image/jpeg;base64," if present
+    raw = base64.b64decode(b64)
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
 _SENTINEL = object()
@@ -154,6 +163,68 @@ async def scan_ws(websocket: WebSocket, job_id: str) -> None:
         except Exception:
             pass
     finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws-live")
+async def live_ws(websocket: WebSocket) -> None:
+    """Live camera scanning: the browser pushes frames, we push back results.
+
+    Protocol (JSON messages):
+      client -> {"type":"init","fps":<n>}          once, first
+      server -> {"type":"ready"}
+      client -> {"type":"frame","image":"<dataURL>"}   (paced: one at a time)
+      server -> {"type":"result","i":n,"image":..,"events":[..]}
+      client -> {"type":"stop"}                     to end
+    """
+    await websocket.accept()
+    loop = asyncio.get_event_loop()
+    processor: FrameProcessor | None = None
+    frame_index = 0
+    try:
+        init = await websocket.receive_json()
+        fps = float(init.get("fps", 6.0)) if isinstance(init, dict) else 6.0
+        processor = await loop.run_in_executor(None, lambda: FrameProcessor(Config(), fps))
+        await websocket.send_json({"type": "ready"})
+
+        while True:
+            msg = await websocket.receive_json()
+            mtype = msg.get("type") if isinstance(msg, dict) else None
+            if mtype == "stop":
+                break
+            if mtype != "frame":
+                continue
+
+            frame = _decode_frame(msg["image"])
+            if frame is None:
+                continue
+
+            annotated, new_events = await loop.run_in_executor(
+                None, processor.process, frame, frame_index
+            )
+            await websocket.send_json(
+                {
+                    "type": "result",
+                    "i": frame_index,
+                    "image": _encode_frame(annotated),
+                    "events": [asdict(e) for e in new_events],
+                }
+            )
+            frame_index += 1
+    except WebSocketDisconnect:
+        logger.info("Live client disconnected after %d frames.", frame_index)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Live scan failed")
+        try:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
+    finally:
+        if processor is not None:
+            await loop.run_in_executor(None, processor.finalize)
         try:
             await websocket.close()
         except Exception:

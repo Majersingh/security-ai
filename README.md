@@ -127,31 +127,48 @@ security-ai/
 
 ## Web UI (live streaming scan)
 
-Upload a video in the browser and watch the AI scan it frame-by-frame, drawing
-boxes live with an event log that fills in as violations occur.
+Two input modes, chosen with a toggle on the page:
+
+1. **📁 Upload Video** — upload a file and watch it scanned frame-by-frame.
+2. **📹 Live Camera** — scan your webcam feed in real time.
 
 ```bash
 pip install -r requirements-web.txt
 python -m uvicorn web.server:app --host 0.0.0.0 --port 8000 --app-dir .
 ```
 
-Then open <http://localhost:8000>, pick a video, and click **Upload & Scan**.
+Then open <http://localhost:8000>.
 
-How it works: the browser POSTs the video to `/upload`, then opens a WebSocket
-to `/ws/{job_id}`. The server runs the **same** CV pipeline (`StreamingScanner`
-in `src/streaming.py` reuses `Detector`/`Tracker`/`BehaviorEngine`/`Annotator`)
-and pushes each annotated frame (JPEG, downscaled for transport) plus any new
-events to the browser. Detection still runs at full resolution; only the
-streamed preview is downscaled.
+### How it works
 
-> On CPU the preview plays in slow motion (inference is ~2–5 fps at 1440p) —
-> which reads naturally as "scanning". Use `--device 0` in `config.py` /
-> hardware with a GPU for real-time throughput.
+Both modes reuse the **same** CV pipeline via `FrameProcessor` in
+`src/streaming.py` (which wraps `Detector`/`Tracker`/`BehaviorEngine`/
+`Annotator`). Only the frame *source* differs:
+
+| Mode | Endpoint | Frame source |
+|------|----------|--------------|
+| Upload | `POST /upload` → WS `/ws/{job_id}` | server reads the uploaded file |
+| Camera | WS `/ws-live` | browser captures frames and pushes them up |
+
+For the camera, the browser grabs frames with `getUserMedia`, sends each one as
+a JPEG over the WebSocket, the server runs the pipeline and returns the
+annotated frame + any events. Sending is **paced** (one frame in flight at a
+time), so it naturally throttles to the server's processing speed.
+
+> ⚠️ **Camera access requires a secure context.** Browsers only allow
+> `getUserMedia` on `https://` **or** `http://localhost`. Over a plain-HTTP LAN
+> IP the camera button will be blocked — deploy behind HTTPS (e.g. a Cloudflare
+> tunnel or a TLS reverse proxy) for the camera mode to work remotely. Upload
+> mode works over plain HTTP.
+
+> On CPU, inference is ~2–5 fps at 1440p, so the preview plays in slow motion —
+> which reads naturally as "scanning". A GPU (`device` in `config.py`) makes it
+> real-time.
 
 ```
 web/
-  server.py          FastAPI: /upload, /ws/{job_id}, serves the UI
-  static/index.html  single-page front-end (upload, live video, event log)
+  server.py          FastAPI: /upload, /ws/{job_id}, /ws-live, serves the UI
+  static/index.html  single-page front-end (mode toggle, live video, event log)
 ```
 
 ## Tuning notes (accuracy)
