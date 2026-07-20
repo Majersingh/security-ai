@@ -148,31 +148,30 @@ class PhoneUsageRule(BehaviorRule):
 
 
 class ZoneIntrusionRule(BehaviorRule):
-    """Flags a person who is inside a user-defined polygon zone.
+    """Flags a person whose bounding box OVERLAPS a user-defined polygon zone.
 
-    Sustained behaviour: a person must stay inside for ``violation_start_seconds``
-    before an event fires (debounced), so brief clipping of the zone edge does
-    not spam events. Uses the person's feet (BOTTOM_CENTER) as the test point.
+    Overlap-based (not a single anchor point), so *any* part of the person
+    entering the zone counts. Sustained + debounced: the overlap must persist for
+    ``violation_start_seconds`` before an event fires, so brief edge-clipping does
+    not spam events.
     """
 
     name = "zone_intrusion"
 
-    _ANCHORS = {
-        "center": sv.Position.CENTER,
-        "bottom_center": sv.Position.BOTTOM_CENTER,
-        "top_center": sv.Position.TOP_CENTER,
-    }
-
     def __init__(self, config: Config, polygon: np.ndarray) -> None:
         super().__init__(config)
         self._polygon = np.asarray(polygon, dtype=np.int64)
-        anchor = self._ANCHORS.get(
-            str(getattr(config, "zone_anchor", "center")).lower(), sv.Position.CENTER
-        )
-        self._zone = sv.PolygonZone(
-            polygon=self._polygon,
-            triggering_anchors=(anchor,),
-        )
+
+    def _overlap_ratio(self, box: BBox) -> float:
+        """Fraction of the person box area that lies inside the polygon."""
+        x1, y1, x2, y2 = (int(v) for v in box)
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
+            return 0.0
+        mask = np.zeros((h, w), dtype=np.uint8)
+        shifted = (self._polygon - np.array([x1, y1])).astype(np.int32)
+        cv2.fillPoly(mask, [shifted], 1)
+        return float(mask.sum()) / float(w * h)
 
     def evaluate(
         self, persons: sv.Detections, phones: sv.Detections
@@ -180,16 +179,14 @@ class ZoneIntrusionRule(BehaviorRule):
         observations: List[Observation] = []
         if len(persons) == 0 or persons.tracker_id is None:
             return observations
-        inside = self._zone.trigger(persons)  # bool array aligned to persons
-        for i, is_in in enumerate(inside):
+        for i in range(len(persons)):
             track_id = persons.tracker_id[i]
-            if not is_in or track_id is None or track_id < 0:
+            if track_id is None or track_id < 0:
                 continue
             box: BBox = tuple(persons.xyxy[i])
-            conf = float(persons.confidence[i]) if persons.confidence is not None else 1.0
-            observations.append(
-                Observation(int(track_id), self.name, conf, box, box)
-            )
+            if self._overlap_ratio(box) > self.config.zone_overlap_ratio:
+                conf = float(persons.confidence[i]) if persons.confidence is not None else 1.0
+                observations.append(Observation(int(track_id), self.name, conf, box, box))
         return observations
 
     def draw(self, frame: np.ndarray) -> None:
@@ -201,11 +198,12 @@ class ZoneIntrusionRule(BehaviorRule):
 
 
 class LineCrossingRule(BehaviorRule):
-    """Fires an event when a person crosses a user-defined line (direction-aware).
+    """Tripwire: fires when a person's bounding box touches/crosses the line.
 
-    Instant behaviour: a crossing is a momentary transition, so it emits an
-    :class:`InstantEvent` immediately rather than going through the debounce
-    machine. Tracks a running in/out count for the overlay.
+    Fires immediately on the transition from *not touching* to *touching* (so it
+    catches a quick pass-through), and only once per touch — it will not re-fire
+    while the box stays on the line, but will fire again on a fresh touch. This
+    matches "if anyone crosses the line, detect it".
     """
 
     name = "line_crossing"
@@ -214,16 +212,21 @@ class LineCrossingRule(BehaviorRule):
         super().__init__(config)
         self._start = (int(start[0]), int(start[1]))
         self._end = (int(end[0]), int(end[1]))
-        self._line = sv.LineZone(
-            start=sv.Point(*self._start),
-            end=sv.Point(*self._end),
-            triggering_anchors=(sv.Position.CENTER,),
-        )
+        self._touching: Dict[int, bool] = {}  # track_id -> was touching last frame
+        self._hits = 0
+
+    def _box_touches_line(self, box: BBox) -> bool:
+        x1, y1, x2, y2 = (int(v) for v in box)
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
+            return False
+        intersects, _, _ = cv2.clipLine((x1, y1, w, h), self._start, self._end)
+        return bool(intersects)
 
     def evaluate(
         self, persons: sv.Detections, phones: sv.Detections
     ) -> List[Observation]:
-        return []  # not a sustained behaviour
+        return []  # handled as instant (tripwire) events below
 
     def instant_events(
         self, persons: sv.Detections, phones: sv.Detections
@@ -231,23 +234,29 @@ class LineCrossingRule(BehaviorRule):
         events: List[InstantEvent] = []
         if len(persons) == 0 or persons.tracker_id is None:
             return events
-        crossed_in, crossed_out = self._line.trigger(persons)
+        seen = set()
         for i in range(len(persons)):
             track_id = persons.tracker_id[i]
             if track_id is None or track_id < 0:
                 continue
+            tid = int(track_id)
+            seen.add(tid)
             box: BBox = tuple(persons.xyxy[i])
-            conf = float(persons.confidence[i]) if persons.confidence is not None else 1.0
-            if crossed_in[i]:
-                events.append(InstantEvent(int(track_id), f"{self.label} (in)", conf, box))
-            if crossed_out[i]:
-                events.append(InstantEvent(int(track_id), f"{self.label} (out)", conf, box))
+            touching = self._box_touches_line(box)
+            was = self._touching.get(tid, False)
+            if touching and not was:  # fresh touch -> fire once
+                conf = float(persons.confidence[i]) if persons.confidence is not None else 1.0
+                events.append(InstantEvent(tid, self.label, conf, box))
+                self._hits += 1
+            self._touching[tid] = touching
+        # forget tracks no longer present so a returning person can re-fire
+        for gone in [t for t in self._touching if t not in seen]:
+            self._touching.pop(gone, None)
         return events
 
     def draw(self, frame: np.ndarray) -> None:
         cv2.line(frame, self._start, self._end, (255, 255, 0), 2)
-        label = f"LINE  in:{self._line.in_count}  out:{self._line.out_count}"
-        cv2.putText(frame, label, (self._start[0], max(0, self._start[1] - 8)),
+        cv2.putText(frame, f"LINE  hits:{self._hits}", (self._start[0], max(0, self._start[1] - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
 
 

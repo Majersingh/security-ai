@@ -74,10 +74,9 @@ class Config:
     zone_polygon: Optional[List[Tuple[int, int]]] = None
     line_start: Optional[Tuple[int, int]] = None
     line_end: Optional[Tuple[int, int]] = None
-    # Which point of a person's box must be inside the zone to count as "in":
-    # "center"        -> box centre (best for webcam / head-and-shoulders views)
-    # "bottom_center" -> the feet   (best for overhead CCTV floor zones)
-    zone_anchor: str = "center"
+    # A person triggers the zone when their bounding box OVERLAPS the polygon by
+    # at least this fraction of the box area. 0.0 = any overlap at all triggers.
+    zone_overlap_ratio: float = 0.0
 
     # -------------------------------------------------------------- rendering
     color_person: Color = (0, 200, 0)      # green

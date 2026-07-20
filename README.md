@@ -175,10 +175,12 @@ web/
 
 Two extra behaviours can be enabled by defining geometry:
 
-- **Zone intrusion** (`sv.PolygonZone`) — alert when a person is *inside* a
-  polygon area. Sustained: debounced like phone usage (one event per stay).
-- **Line crossing** (`sv.LineZone`) — alert/count when a person *crosses* a
-  line, direction-aware (in vs out). Momentary: fires immediately on crossing.
+- **Zone intrusion** — alert when a person's bounding box **overlaps** the
+  polygon (any part enters, not just a single point). Sustained + debounced
+  (one event per stay). Sensitivity via `zone_overlap_ratio` (0.0 = any overlap).
+- **Line tripwire** — alert when a person's box **touches/crosses** the line.
+  Fires immediately on the first touch and once per touch (re-fires on a fresh
+  touch), so a quick pass-through is caught.
 
 Both are implemented as `BehaviorRule` subclasses in `src/behavior.py` and are
 registered automatically by `build_rules()` when geometry is provided — no
