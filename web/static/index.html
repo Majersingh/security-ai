@@ -65,6 +65,15 @@
   @keyframes flash { from { background: rgba(248,81,73,.35); } to { background: transparent; } }
   .legend { font-size: 12px; color: var(--muted); margin-top: 10px; display: flex; gap: 16px; flex-wrap: wrap; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+
+  /* drawing overlay + toolbar */
+  #draw { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  #draw.active { pointer-events: auto; cursor: crosshair; }
+  .drawbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 12px 0 0; }
+  .drawbar .tool { background: #21262d; border: 1px solid var(--border); color: var(--text);
+    padding: 6px 12px; font-size: 13px; }
+  .drawbar .tool.on { border-color: var(--accent); background: #1c2333; }
+  .drawbar .info { font-size: 12px; color: var(--muted); margin-left: 4px; }
 </style>
 </head>
 <body>
@@ -97,7 +106,18 @@
         <div class="scanline"></div>
         <div class="placeholder" id="placeholder">Preview will appear here.</div>
         <video id="cam" autoplay playsinline muted class="hidden"></video>
+        <video id="uploadPreview" muted playsinline class="hidden"></video>
         <img id="frame" class="hidden" />
+        <canvas id="draw"></canvas>
+      </div>
+
+      <div class="drawbar">
+        <span style="font-size:12px;color:var(--muted)">Draw detection area:</span>
+        <button class="tool" id="toolLine">Line</button>
+        <button class="tool" id="toolZone">Zone</button>
+        <button class="tool" id="toolFinish" style="display:none">Finish Zone</button>
+        <button class="tool" id="toolClear">Clear</button>
+        <span class="info" id="drawInfo">none set</span>
       </div>
       <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
       <div class="statline">
@@ -146,6 +166,7 @@ $("tabCamera").onclick = () => setMode("camera");
 function resetView() {
   $("frame").classList.add("hidden");
   $("cam").classList.add("hidden");
+  $("uploadPreview").classList.add("hidden");
   $("placeholder").classList.remove("hidden");
   $("stage").classList.remove("scanning");
   $("liveBadge").classList.add("hidden");
@@ -178,6 +199,17 @@ $("file").addEventListener("change", (e) => {
   selectedFile = e.target.files[0] || null;
   $("scanBtn").disabled = !selectedFile;
   $("uploadStatus").textContent = selectedFile ? `Ready: ${selectedFile.name}` : "Choose a video to begin.";
+  if (!selectedFile) return;
+  // Show the first frame locally so the user can draw a zone/line on it.
+  const up = $("uploadPreview");
+  up.src = URL.createObjectURL(selectedFile);
+  up.classList.remove("hidden");
+  $("placeholder").classList.add("hidden");
+  $("frame").classList.add("hidden");
+  up.onloadedmetadata = () => {
+    up.currentTime = 0.1;                       // seek to first frame
+    sizeDrawCanvas(up.videoWidth, up.videoHeight);
+  };
 });
 $("scanBtn").addEventListener("click", startUploadScan);
 
@@ -206,6 +238,8 @@ async function startUploadScan() {
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/${job.job_id}`);
+  // Server expects the geometry config as the first message.
+  ws.onopen = () => ws.send(JSON.stringify(geometryMsg()));
   ws.onmessage = (msg) => {
     const d = JSON.parse(msg.data);
     if (d.type === "meta") {
@@ -232,7 +266,9 @@ function showFrame(b64) {
   img.src = "data:image/jpeg;base64," + b64;
   img.classList.remove("hidden");
   $("cam").classList.add("hidden");
+  $("uploadPreview").classList.add("hidden");
   $("placeholder").classList.add("hidden");
+  clearDrawOverlay();   // server now draws the zone/line into the frame
 }
 function endScan(text, statusId) {
   $(statusId).textContent = text;
@@ -266,6 +302,7 @@ async function enableCamera() {
   cam.onloadedmetadata = () => {
     canvas.width = cam.videoWidth;
     canvas.height = cam.videoHeight;
+    sizeDrawCanvas(cam.videoWidth, cam.videoHeight);   // enable drawing on the feed
   };
   $("startCam").disabled = false;
   $("startCam").classList.remove("hidden");   // was hidden by stopCamera()/setMode()
@@ -287,7 +324,8 @@ function startCameraScan() {
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   camWs = new WebSocket(`${proto}://${location.host}/ws-live`);
-  camWs.onopen = () => camWs.send(JSON.stringify({ type: "init", fps: LIVE_FPS }));
+  camWs.onopen = () =>
+    camWs.send(JSON.stringify({ type: "init", fps: LIVE_FPS, ...geometryMsg() }));
   camWs.onmessage = (msg) => {
     const d = JSON.parse(msg.data);
     if (d.type === "ready") {
@@ -339,6 +377,104 @@ function stopCamera() {
   $("stage").classList.remove("scanning");
   $("liveBadge").classList.add("hidden");
   if ($("camStatus")) $("camStatus").textContent = "Stopped. Click “Enable Camera” to scan again.";
+}
+
+/* ---------------- drawing: line / zone ---------------- */
+const drawCanvas = $("draw");
+const dctx = drawCanvas.getContext("2d");
+let geometry = { zone: null, lineStart: null, lineEnd: null };
+let drawMode = null;      // null | "line" | "zone"
+let tempPoints = [];      // points being collected for the current shape
+
+function sizeDrawCanvas(w, h) {
+  if (!w || !h) return;
+  drawCanvas.width = w; drawCanvas.height = h;
+  redrawGeometry();
+}
+function canvasPoint(e) {
+  const r = drawCanvas.getBoundingClientRect();
+  return [
+    Math.round((e.clientX - r.left) * (drawCanvas.width / r.width)),
+    Math.round((e.clientY - r.top) * (drawCanvas.height / r.height)),
+  ];
+}
+function setTool(mode) {
+  drawMode = mode; tempPoints = [];
+  $("toolLine").classList.toggle("on", mode === "line");
+  $("toolZone").classList.toggle("on", mode === "zone");
+  $("toolFinish").style.display = mode === "zone" ? "inline-block" : "none";
+  drawCanvas.classList.toggle("active", mode !== null);
+  updateDrawInfo();
+}
+$("toolLine").onclick = () => setTool(drawMode === "line" ? null : "line");
+$("toolZone").onclick = () => setTool(drawMode === "zone" ? null : "zone");
+$("toolFinish").onclick = finishZone;
+$("toolClear").onclick = () => {
+  geometry = { zone: null, lineStart: null, lineEnd: null };
+  setTool(null); redrawGeometry(); updateDrawInfo();
+};
+drawCanvas.addEventListener("click", (e) => {
+  if (!drawMode) return;
+  const p = canvasPoint(e);
+  if (drawMode === "line") {
+    tempPoints.push(p);
+    if (tempPoints.length === 2) {
+      geometry.lineStart = tempPoints[0];
+      geometry.lineEnd = tempPoints[1];
+      setTool(null);
+    }
+  } else {
+    tempPoints.push(p);
+  }
+  redrawGeometry(); updateDrawInfo();
+});
+function finishZone() {
+  if (tempPoints.length >= 3) geometry.zone = tempPoints.slice();
+  setTool(null); redrawGeometry(); updateDrawInfo();
+}
+function drawDot(p, c) { dctx.fillStyle = c; dctx.beginPath(); dctx.arc(p[0], p[1], 5, 0, 7); dctx.fill(); }
+function drawLine(a, b, c) {
+  dctx.strokeStyle = c; dctx.lineWidth = 3;
+  dctx.beginPath(); dctx.moveTo(a[0], a[1]); dctx.lineTo(b[0], b[1]); dctx.stroke();
+  drawDot(a, c); drawDot(b, c);
+}
+function drawPoly(pts, stroke, fill, closed) {
+  dctx.strokeStyle = stroke; dctx.fillStyle = fill; dctx.lineWidth = 3;
+  dctx.beginPath(); dctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) dctx.lineTo(pts[i][0], pts[i][1]);
+  if (closed) { dctx.closePath(); dctx.fill(); }
+  dctx.stroke();
+  pts.forEach((p) => drawDot(p, stroke));
+}
+function redrawGeometry() {
+  dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  if (geometry.zone) drawPoly(geometry.zone, "rgba(255,165,0,0.95)", "rgba(255,165,0,0.15)", true);
+  if (geometry.lineStart && geometry.lineEnd) drawLine(geometry.lineStart, geometry.lineEnd, "rgba(0,255,255,0.95)");
+  if (tempPoints.length) {
+    if (drawMode === "zone") drawPoly(tempPoints, "rgba(255,255,0,0.95)", "rgba(255,255,0,0.10)", false);
+    tempPoints.forEach((p) => drawDot(p, "yellow"));
+  }
+}
+function updateDrawInfo() {
+  const parts = [];
+  if (geometry.zone) parts.push(`zone (${geometry.zone.length} pts)`);
+  if (geometry.lineStart) parts.push("line set");
+  if (drawMode === "zone") parts.push(`click points, then Finish (${tempPoints.length})`);
+  if (drawMode === "line") parts.push(`click ${2 - tempPoints.length} point(s)`);
+  $("drawInfo").textContent = parts.length ? parts.join(" · ") : "none set";
+}
+function geometryMsg() {
+  // Send normalized (0..1) coordinates so the server can scale them to the real
+  // frame size regardless of preview/display/stream resolution.
+  const W = drawCanvas.width || 1, H = drawCanvas.height || 1;
+  const nz = geometry.zone ? geometry.zone.map((p) => [p[0] / W, p[1] / H]) : null;
+  const nls = geometry.lineStart ? [geometry.lineStart[0] / W, geometry.lineStart[1] / H] : null;
+  const nle = geometry.lineEnd ? [geometry.lineEnd[0] / W, geometry.lineEnd[1] / H] : null;
+  return { zone_polygon: nz, line_start: nls, line_end: nle, normalized: true };
+}
+function clearDrawOverlay() {
+  dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  drawCanvas.classList.remove("active");
 }
 </script>
 </body>

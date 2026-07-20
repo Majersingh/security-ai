@@ -21,6 +21,7 @@ import supervision as sv
 from ultralytics import YOLO
 
 from config import Config
+from utils import resolve_device
 
 logger = logging.getLogger("operator_monitor")
 
@@ -31,10 +32,13 @@ class Detector:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._keep_classes = sorted({config.person_class_id, config.phone_class_id})
+        self._device = resolve_device(config.device)
         logger.info("Loading YOLO model from '%s' ...", config.model_path)
         # Ultralytics downloads the weight automatically if it is not present.
         self._model = YOLO(str(config.model_path))
-        logger.info("Model loaded (device=%s).", config.device)
+        logger.info(
+            "Model loaded (device=%s, requested=%s).", self._device, config.device
+        )
 
     def detect(self, frame: np.ndarray) -> sv.Detections:
         """Detection only (no tracking ids)."""
@@ -43,7 +47,7 @@ class Detector:
             conf=self._config.confidence_threshold,
             iou=self._config.iou_threshold,
             imgsz=self._config.inference_imgsz,
-            device=self._config.device,
+            device=self._device,
             classes=self._keep_classes,
             verbose=False,
         )[0]
@@ -60,7 +64,7 @@ class Detector:
             conf=self._config.confidence_threshold,
             iou=self._config.iou_threshold,
             imgsz=self._config.inference_imgsz,
-            device=self._config.device,
+            device=self._device,
             classes=self._keep_classes,
             tracker=self._config.tracker_config,
             persist=self._config.persist_tracks,

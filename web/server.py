@@ -91,6 +91,33 @@ def _decode_frame(data_url: str):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
+def _parse_geometry(msg: dict):
+    """Extract (zone_polygon, line_start, line_end) from a client message.
+
+    Coordinates are *normalized* (0..1 fractions of the frame width/height), so
+    they are resolution-independent; the pipeline scales them to pixels once it
+    knows the real frame size. Missing/invalid parts return None so the
+    corresponding rule is simply not registered.
+    """
+    if not isinstance(msg, dict):
+        return None, None, None
+
+    zone = msg.get("zone_polygon")
+    if isinstance(zone, list) and len(zone) >= 3:
+        zone = [(float(p[0]), float(p[1])) for p in zone]
+    else:
+        zone = None
+
+    def _pt(v):
+        return (float(v[0]), float(v[1])) if isinstance(v, (list, tuple)) and len(v) == 2 else None
+
+    line_start = _pt(msg.get("line_start"))
+    line_end = _pt(msg.get("line_end"))
+    if not (line_start and line_end):
+        line_start = line_end = None
+    return zone, line_start, line_end
+
+
 _SENTINEL = object()
 
 
@@ -114,9 +141,17 @@ async def scan_ws(websocket: WebSocket, job_id: str) -> None:
 
     loop = asyncio.get_event_loop()
     try:
+        # First message carries optional zone/line geometry (may be empty {}).
+        cfg_msg = await websocket.receive_json()
+        zone, line_start, line_end = _parse_geometry(cfg_msg)
+
         # Construct the scanner (loads model) off the event loop.
         scanner: StreamingScanner = await loop.run_in_executor(
-            None, lambda: StreamingScanner(Config(), video_path)
+            None,
+            lambda: StreamingScanner(
+                Config(), video_path,
+                zone_polygon=zone, line_start=line_start, line_end=line_end,
+            ),
         )
         await websocket.send_json(
             {
@@ -187,7 +222,14 @@ async def live_ws(websocket: WebSocket) -> None:
     try:
         init = await websocket.receive_json()
         fps = float(init.get("fps", 6.0)) if isinstance(init, dict) else 6.0
-        processor = await loop.run_in_executor(None, lambda: FrameProcessor(Config(), fps))
+        zone, line_start, line_end = _parse_geometry(init)
+        processor = await loop.run_in_executor(
+            None,
+            lambda: FrameProcessor(
+                Config(), fps,
+                zone_polygon=zone, line_start=line_start, line_end=line_end,
+            ),
+        )
         await websocket.send_json({"type": "ready"})
 
         while True:

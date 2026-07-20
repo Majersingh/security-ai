@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 # Project root = one level above this ``src`` directory.
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent
@@ -39,10 +39,16 @@ class Config:
     phone_class_id: int = 67
     confidence_threshold: float = 0.25   # min detection confidence to keep
     iou_threshold: float = 0.5           # NMS IoU for the detector
-    device: str = "cpu"                  # "cpu", "0", "cuda:0", "mps"
+    # "auto" picks GPU (cuda/mps) if available, else cpu. Or force: "cpu","0","mps".
+    device: str = "auto"
     # High-res CCTV footage: a phone is tiny relative to the frame, so 640
     # downscaling loses it. 1280 detects it reliably (see README notes).
     inference_imgsz: int = 1280          # model input resolution
+
+    # Process only every Nth frame (1 = every frame). E.g. on a 30 fps video,
+    # frame_stride=30 analyses ~1 frame/second: much faster, coarser timing.
+    # Time-based thresholds auto-adjust to the effective rate (fps / stride).
+    frame_stride: int = 10
 
     # ---------------------------------------------------------------- tracker
     # Ultralytics built-in tracker config: "bytetrack.yaml" or "botsort.yaml".
@@ -53,12 +59,25 @@ class Config:
     # A phone counts as "in use" when it is close to a person. We inflate the
     # person box by this fraction and check whether the phone overlaps it.
     proximity_margin: float = 0.15       # 15% of person box size, each side
-    min_containment: float = 0.30        # >=30% of the phone box inside person
+    min_containment: float = 0.10        # >=10% of the phone box inside person
 
     # Debounced state machine (seconds -> frames at runtime).
     violation_start_seconds: float = 1.0   # sustained before an event fires
     violation_end_seconds: float = 1.5     # sustained absence before it ends
     snapshot_cooldown_seconds: float = 5.0 # min gap between snapshots per track
+
+    # ------------------------------------------------------- zone / line rules
+    # Optional geometry in native frame pixels. None = rule disabled.
+    # zone_polygon: list of (x, y) points, e.g. [(400,200),(900,200),(900,700),(400,700)]
+    # line_start / line_end: two (x, y) points defining a crossing line.
+    # The web UI can supply these by letting the user draw on the video.
+    zone_polygon: Optional[List[Tuple[int, int]]] = None
+    line_start: Optional[Tuple[int, int]] = None
+    line_end: Optional[Tuple[int, int]] = None
+    # Which point of a person's box must be inside the zone to count as "in":
+    # "center"        -> box centre (best for webcam / head-and-shoulders views)
+    # "bottom_center" -> the feet   (best for overhead CCTV floor zones)
+    zone_anchor: str = "center"
 
     # -------------------------------------------------------------- rendering
     color_person: Color = (0, 200, 0)      # green
@@ -73,7 +92,11 @@ class Config:
 
     # Human-readable event label, kept here so wording is not scattered around.
     event_labels: dict = field(
-        default_factory=lambda: {"phone_usage": "Mobile Phone Usage"}
+        default_factory=lambda: {
+            "phone_usage": "Mobile Phone Usage",
+            "zone_intrusion": "Zone Intrusion",
+            "line_crossing": "Line Crossing",
+        }
     )
 
     def ensure_output_dirs(self) -> None:

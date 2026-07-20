@@ -35,6 +35,29 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     return logger
 
 
+def resolve_device(device: str) -> str:
+    """Resolve a device string, auto-detecting hardware when ``device='auto'``.
+
+    Returns ``"cuda:0"`` if an NVIDIA GPU is available, ``"mps"`` on Apple
+    Silicon, otherwise ``"cpu"``. Any explicit value (e.g. ``"0"``, ``"cpu"``)
+    is returned unchanged so users can still force a device.
+    """
+    requested = (device or "auto").strip().lower()
+    if requested != "auto":
+        return device
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda:0"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:  # torch missing or misconfigured -> fall back safely
+        pass
+    return "cpu"
+
+
 def inflate_box(box: BBox, margin: float) -> BBox:
     """Expand a box outward by ``margin`` fraction of its width/height."""
     x1, y1, x2, y2 = box

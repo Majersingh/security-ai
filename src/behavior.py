@@ -19,8 +19,10 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import cv2
+import numpy as np
 import supervision as sv
 
 from config import Config
@@ -29,16 +31,37 @@ from utils import BBox, containment, format_timestamp, inflate_box, iou
 
 logger = logging.getLogger("operator_monitor")
 
+Point = Tuple[int, int]
+
 
 @dataclass
 class Observation:
-    """A per-frame signal from a rule that a track is violating."""
+    """A per-frame signal from a rule that a track is *sustaining* a violation.
+
+    Sustained observations go through the debounce state machine (one event per
+    episode). Use this for state-like behaviours (phone usage, being inside a
+    zone).
+    """
 
     track_id: int
     rule_name: str
     confidence: float
     person_box: BBox
     # Region to snapshot / highlight (defaults to the person box).
+    focus_box: BBox
+
+
+@dataclass
+class InstantEvent:
+    """A one-off event that fired on this exact frame (e.g. a line crossing).
+
+    Instant events bypass the debounce machine and are logged immediately, since
+    they represent a momentary transition rather than a sustained state.
+    """
+
+    track_id: int
+    label: str
+    confidence: float
     focus_box: BBox
 
 
@@ -60,8 +83,21 @@ class BehaviorRule(ABC):
     def evaluate(
         self, persons: sv.Detections, phones: sv.Detections
     ) -> List[Observation]:
-        """Return an observation for every *currently violating* track."""
+        """Return a *sustained* observation for every currently-violating track.
+
+        Return an empty list for rules that only produce instant events.
+        """
         raise NotImplementedError
+
+    def instant_events(
+        self, persons: sv.Detections, phones: sv.Detections
+    ) -> List[InstantEvent]:
+        """Return one-off events that fired on this frame (default: none)."""
+        return []
+
+    def draw(self, frame: np.ndarray) -> None:
+        """Optionally draw this rule's geometry (zone/line) onto the frame."""
+        return None
 
 
 class PhoneUsageRule(BehaviorRule):
@@ -111,6 +147,135 @@ class PhoneUsageRule(BehaviorRule):
         return observations
 
 
+class ZoneIntrusionRule(BehaviorRule):
+    """Flags a person who is inside a user-defined polygon zone.
+
+    Sustained behaviour: a person must stay inside for ``violation_start_seconds``
+    before an event fires (debounced), so brief clipping of the zone edge does
+    not spam events. Uses the person's feet (BOTTOM_CENTER) as the test point.
+    """
+
+    name = "zone_intrusion"
+
+    _ANCHORS = {
+        "center": sv.Position.CENTER,
+        "bottom_center": sv.Position.BOTTOM_CENTER,
+        "top_center": sv.Position.TOP_CENTER,
+    }
+
+    def __init__(self, config: Config, polygon: np.ndarray) -> None:
+        super().__init__(config)
+        self._polygon = np.asarray(polygon, dtype=np.int64)
+        anchor = self._ANCHORS.get(
+            str(getattr(config, "zone_anchor", "center")).lower(), sv.Position.CENTER
+        )
+        self._zone = sv.PolygonZone(
+            polygon=self._polygon,
+            triggering_anchors=(anchor,),
+        )
+
+    def evaluate(
+        self, persons: sv.Detections, phones: sv.Detections
+    ) -> List[Observation]:
+        observations: List[Observation] = []
+        if len(persons) == 0 or persons.tracker_id is None:
+            return observations
+        inside = self._zone.trigger(persons)  # bool array aligned to persons
+        for i, is_in in enumerate(inside):
+            track_id = persons.tracker_id[i]
+            if not is_in or track_id is None or track_id < 0:
+                continue
+            box: BBox = tuple(persons.xyxy[i])
+            conf = float(persons.confidence[i]) if persons.confidence is not None else 1.0
+            observations.append(
+                Observation(int(track_id), self.name, conf, box, box)
+            )
+        return observations
+
+    def draw(self, frame: np.ndarray) -> None:
+        pts = self._polygon.reshape((-1, 1, 2))
+        cv2.polylines(frame, [pts], isClosed=True, color=(0, 165, 255), thickness=2)
+        x, y = int(self._polygon[0][0]), int(self._polygon[0][1])
+        cv2.putText(frame, "ZONE", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 165, 255), 2, cv2.LINE_AA)
+
+
+class LineCrossingRule(BehaviorRule):
+    """Fires an event when a person crosses a user-defined line (direction-aware).
+
+    Instant behaviour: a crossing is a momentary transition, so it emits an
+    :class:`InstantEvent` immediately rather than going through the debounce
+    machine. Tracks a running in/out count for the overlay.
+    """
+
+    name = "line_crossing"
+
+    def __init__(self, config: Config, start: Point, end: Point) -> None:
+        super().__init__(config)
+        self._start = (int(start[0]), int(start[1]))
+        self._end = (int(end[0]), int(end[1]))
+        self._line = sv.LineZone(
+            start=sv.Point(*self._start),
+            end=sv.Point(*self._end),
+            triggering_anchors=(sv.Position.CENTER,),
+        )
+
+    def evaluate(
+        self, persons: sv.Detections, phones: sv.Detections
+    ) -> List[Observation]:
+        return []  # not a sustained behaviour
+
+    def instant_events(
+        self, persons: sv.Detections, phones: sv.Detections
+    ) -> List[InstantEvent]:
+        events: List[InstantEvent] = []
+        if len(persons) == 0 or persons.tracker_id is None:
+            return events
+        crossed_in, crossed_out = self._line.trigger(persons)
+        for i in range(len(persons)):
+            track_id = persons.tracker_id[i]
+            if track_id is None or track_id < 0:
+                continue
+            box: BBox = tuple(persons.xyxy[i])
+            conf = float(persons.confidence[i]) if persons.confidence is not None else 1.0
+            if crossed_in[i]:
+                events.append(InstantEvent(int(track_id), f"{self.label} (in)", conf, box))
+            if crossed_out[i]:
+                events.append(InstantEvent(int(track_id), f"{self.label} (out)", conf, box))
+        return events
+
+    def draw(self, frame: np.ndarray) -> None:
+        cv2.line(frame, self._start, self._end, (255, 255, 0), 2)
+        label = f"LINE  in:{self._line.in_count}  out:{self._line.out_count}"
+        cv2.putText(frame, label, (self._start[0], max(0, self._start[1] - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
+
+
+def build_rules(
+    config: Config,
+    zone_polygon: Optional[Sequence[Point]] = None,
+    line_start: Optional[Point] = None,
+    line_end: Optional[Point] = None,
+) -> List[BehaviorRule]:
+    """Assemble the active rule list. Zone/line rules are added only if defined.
+
+    Falls back to the geometry in ``config`` when arguments are not given, so the
+    CLI (config-driven) and the web UI (drawn coordinates) share this factory.
+    """
+    zone_polygon = zone_polygon if zone_polygon is not None else config.zone_polygon
+    line_start = line_start if line_start is not None else config.line_start
+    line_end = line_end if line_end is not None else config.line_end
+
+    rules: List[BehaviorRule] = [PhoneUsageRule(config)]
+    if zone_polygon and len(zone_polygon) >= 3:
+        rules.append(ZoneIntrusionRule(config, np.array(zone_polygon, dtype=np.int64)))
+        logger.info("ZoneIntrusionRule active (%d points).", len(zone_polygon))
+    if line_start and line_end:
+        rules.append(LineCrossingRule(config, line_start, line_end))
+        logger.info("LineCrossingRule active (%s -> %s).", line_start, line_end)
+    return rules
+
+
 @dataclass
 class _TrackState:
     """Debounce state for one (track, rule) pair."""
@@ -141,15 +306,21 @@ class BehaviorEngine:
         event_log: EventLog,
         snapshots: SnapshotManager,
         fps: float,
+        processing_fps: float | None = None,
     ) -> None:
         self._config = config
         self._rules = rules
         self._event_log = event_log
         self._snapshots = snapshots
+        # Real video fps: used for event timestamps and the snapshot cooldown
+        # (which compares real frame indices).
         self._fps = fps if fps > 0 else 30.0
+        # Effective rate of frames actually processed (fps / frame_stride).
+        # Start/end thresholds count *processed* frames, so they use this.
+        proc_fps = processing_fps if processing_fps and processing_fps > 0 else self._fps
 
-        self._start_frames = max(1, round(config.violation_start_seconds * self._fps))
-        self._end_frames = max(1, round(config.violation_end_seconds * self._fps))
+        self._start_frames = max(1, round(config.violation_start_seconds * proc_fps))
+        self._end_frames = max(1, round(config.violation_end_seconds * proc_fps))
         self._snapshot_cooldown = max(1, round(config.snapshot_cooldown_seconds * self._fps))
 
         # (track_id, rule_name) -> _TrackState
@@ -175,7 +346,16 @@ class BehaviorEngine:
             observations = {o.track_id: o for o in rule.evaluate(persons, phones)}
             self._update_rule_states(rule, observations, frame_index, frame, result)
 
+            # Instant (momentary) events bypass the debounce machine.
+            for inst in rule.instant_events(persons, phones):
+                self._emit_instant(rule, inst, frame_index, frame, result)
+
         return result
+
+    def draw_overlays(self, frame: np.ndarray) -> None:
+        """Let each rule render its geometry (zones/lines) onto the frame."""
+        for rule in self._rules:
+            rule.draw(frame)
 
     def _update_rule_states(
         self,
@@ -223,6 +403,34 @@ class BehaviorEngine:
                 event=rule.label,
                 confidence=round(obs.confidence, 3),
             )
+        )
+
+    def _emit_instant(
+        self,
+        rule: BehaviorRule,
+        inst: InstantEvent,
+        frame_index: int,
+        frame,
+        result: FrameResult,
+    ) -> None:
+        """Log a one-off event immediately and flag it for this frame's overlay."""
+        self._event_log.add(
+            Event(
+                timestamp=format_timestamp(frame_index, self._fps),
+                frame_number=frame_index,
+                person_id=inst.track_id,
+                event=inst.label,
+                confidence=round(inst.confidence, 3),
+            )
+        )
+        result.violating_track_ids.add(inst.track_id)
+        result.labels[inst.track_id] = inst.label
+        # Crossings are discrete, so snapshot every one (no cooldown).
+        self._snapshots.save(
+            frame=frame,
+            frame_number=frame_index,
+            prefix=rule.name.split("_")[0],  # e.g. "line"
+            crop_box=inflate_box(inst.focus_box, 0.05),
         )
 
     def _maybe_snapshot(

@@ -171,6 +171,75 @@ web/
   static/index.html  single-page front-end (mode toggle, live video, event log)
 ```
 
+## Zone & line detection (intrusion + crossing)
+
+Two extra behaviours can be enabled by defining geometry:
+
+- **Zone intrusion** (`sv.PolygonZone`) — alert when a person is *inside* a
+  polygon area. Sustained: debounced like phone usage (one event per stay).
+- **Line crossing** (`sv.LineZone`) — alert/count when a person *crosses* a
+  line, direction-aware (in vs out). Momentary: fires immediately on crossing.
+
+Both are implemented as `BehaviorRule` subclasses in `src/behavior.py` and are
+registered automatically by `build_rules()` when geometry is provided — no
+pipeline changes. Events land in the same `events.csv` (`Zone Intrusion`,
+`Line Crossing (in)`/`(out)`), with snapshots.
+
+### Define geometry by drawing in the browser (recommended)
+
+In the web UI, use the **Draw detection area** toolbar under the video:
+
+1. Pick a video (or enable the camera) — the first frame appears.
+2. Click **Line** and click 2 points, and/or **Zone**, click ≥3 points, then
+   **Finish Zone**. **Clear** removes them.
+3. Start the scan. The drawn coordinates are sent to the server, which runs the
+   rules and draws the zone/line onto the output.
+
+### Define geometry in config (fixed camera)
+
+Coordinates are in native frame pixels:
+
+```python
+# src/config.py
+zone_polygon = [(400, 200), (900, 200), (900, 700), (400, 700)]
+line_start   = (0, 500)
+line_end     = (1280, 500)
+```
+
+## Tuning knobs (where to change behaviour)
+
+All values live in `src/config.py`; the common ones also have CLI flags.
+
+**When is a "Mobile Phone Usage" event logged?**
+A single phone detection is *not* enough. A phone must stay near the person
+**continuously for `violation_start_seconds` (default 1.0 s)**, then **one**
+event fires for the whole episode. The episode ends after
+`violation_end_seconds` (1.5 s) without the phone.
+
+| Knob (`config.py`) | Default | Effect | CLI |
+|---|---|---|---|
+| `violation_start_seconds` | 1.0 | How long the phone must be used before logging | `--start-seconds` |
+| `violation_end_seconds` | 1.5 | Gap of no-phone that ends an episode | — |
+| `confidence_threshold` | 0.25 | Min detection score | `--conf` |
+| `proximity_margin` | 0.15 | Person box inflation when testing "near" | — |
+| `min_containment` | 0.30 | Fraction of phone inside person to count | — |
+| `snapshot_cooldown_seconds` | 5.0 | Gap between snapshots in one episode | — |
+| `inference_imgsz` | 1280 | Detection resolution (accuracy vs speed) | — |
+| `frame_stride` | 1 | Analyse every Nth frame (speed) | `--frame-stride` |
+
+**Frame sampling (`frame_stride`).** To analyse fewer frames on a 30 fps video:
+
+```bash
+python src/main.py --frame-stride 30    # ~1 analysed frame per second (~30x faster)
+python src/main.py --frame-stride 5     # every 5th frame (~5x faster)
+```
+
+Time-based thresholds **auto-adjust** to the effective rate (`fps / stride`), so
+"1 second of phone use" still means 1 real second regardless of stride. Event
+timestamps also stay accurate to the original video time. Trade-off: higher
+stride = coarser timing and slightly less stable tracking IDs during fast
+motion. Also honoured by the web UI's upload mode.
+
 ## Tuning notes (accuracy)
 
 - **Detection resolution matters on high-res footage.** In 2560×1440 CCTV a

@@ -19,19 +19,22 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from annotator import Annotator
-from behavior import BehaviorEngine, PhoneUsageRule
+from behavior import BehaviorEngine, build_rules
 from config import Config
 from events import Event, EventLog, SnapshotManager
 from detector import Detector
 from tracker import Tracker
+from utils import BBox  # noqa: F401  (re-exported for type users)
 
 logger = logging.getLogger("operator_monitor")
+
+Point = Tuple[int, int]
 
 
 @dataclass
@@ -48,29 +51,67 @@ class ScanUpdate:
 class FrameProcessor:
     """Stateful, single-frame pipeline shared by video and live camera modes."""
 
-    def __init__(self, config: Config, fps: float) -> None:
+    def __init__(
+        self,
+        config: Config,
+        fps: float,
+        processing_fps: float | None = None,
+        zone_polygon: Optional[List[Point]] = None,
+        line_start: Optional[Point] = None,
+        line_end: Optional[Point] = None,
+    ) -> None:
+        # zone/line coordinates are *normalized* (0..1 fractions of width/height)
+        # so they are independent of the frame resolution. They are scaled to
+        # pixels lazily on the first frame, once the real frame size is known.
         self._config = config
         config.ensure_output_dirs()
         self._detector = Detector(config)
         self._tracker = Tracker(config)
         self._event_log = EventLog(config)
         self._snapshots = SnapshotManager(config)
+        self._annotator = Annotator(config)
+        self._fps = fps
+        self._processing_fps = processing_fps
+        self._norm_zone = zone_polygon
+        self._norm_line_start = line_start
+        self._norm_line_end = line_end
+        self._engine: Optional[BehaviorEngine] = None  # built on first frame
+
+    def _build_engine(self, width: int, height: int) -> None:
+        def poly_px(poly):
+            if not poly:
+                return None
+            return [(int(round(fx * width)), int(round(fy * height))) for fx, fy in poly]
+
+        def pt_px(pt):
+            return (int(round(pt[0] * width)), int(round(pt[1] * height))) if pt else None
+
+        rules = build_rules(
+            self._config,
+            zone_polygon=poly_px(self._norm_zone),
+            line_start=pt_px(self._norm_line_start),
+            line_end=pt_px(self._norm_line_end),
+        )
         self._engine = BehaviorEngine(
-            config=config,
-            rules=[PhoneUsageRule(config)],
+            config=self._config,
+            rules=rules,
             event_log=self._event_log,
             snapshots=self._snapshots,
-            fps=fps,
+            fps=self._fps,
+            processing_fps=self._processing_fps,
         )
-        self._annotator = Annotator(config)
 
     def process(self, frame: np.ndarray, frame_index: int) -> Tuple[np.ndarray, List[Event]]:
         """Run the full pipeline on one frame; return (annotated, new_events)."""
+        if self._engine is None:
+            h, w = frame.shape[:2]
+            self._build_engine(w, h)
         before = len(self._event_log)
         detections = self._detector.track(frame)
         persons, phones = self._tracker.route(detections)
         result = self._engine.process(persons, phones, frame_index, frame)
         annotated = self._annotator.annotate(frame, persons, phones, result)
+        self._engine.draw_overlays(annotated)  # zone/line overlays
         new_events = self._event_log.events[before:]
         return annotated, new_events
 
@@ -90,7 +131,14 @@ class FrameProcessor:
 class StreamingScanner:
     """Drives :class:`FrameProcessor` over an uploaded video file."""
 
-    def __init__(self, config: Config, video_path: Path) -> None:
+    def __init__(
+        self,
+        config: Config,
+        video_path: Path,
+        zone_polygon: Optional[List[Point]] = None,
+        line_start: Optional[Point] = None,
+        line_end: Optional[Point] = None,
+    ) -> None:
         self._config = config
         config.input_video = Path(video_path)
 
@@ -105,7 +153,11 @@ class StreamingScanner:
         self.height = int(self._capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.total_frames = int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        self._proc = FrameProcessor(config, self.fps)
+        self._stride = max(1, config.frame_stride)
+        self._proc = FrameProcessor(
+            config, self.fps, processing_fps=self.fps / self._stride,
+            zone_polygon=zone_polygon, line_start=line_start, line_end=line_end,
+        )
 
     def scan(self) -> Iterator[ScanUpdate]:
         """Generator over processed frames."""
@@ -115,6 +167,9 @@ class StreamingScanner:
                 ok, frame = self._capture.read()
                 if not ok:
                     break
+                if frame_index % self._stride != 0:
+                    frame_index += 1
+                    continue
                 annotated, new_events = self._proc.process(frame, frame_index)
                 yield ScanUpdate(
                     frame_index=frame_index,
