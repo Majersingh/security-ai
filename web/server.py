@@ -223,10 +223,14 @@ async def live_ws(websocket: WebSocket) -> None:
         init = await websocket.receive_json()
         fps = float(init.get("fps", 6.0)) if isinstance(init, dict) else 6.0
         zone, line_start, line_end = _parse_geometry(init)
+        # Live webcam: the person is large/close, so a smaller inference size is
+        # plenty and much faster than the 1280 used for CCTV upload footage.
+        live_cfg = Config()
+        live_cfg.inference_imgsz = 640
         processor = await loop.run_in_executor(
             None,
             lambda: FrameProcessor(
-                Config(), fps,
+                live_cfg, fps,
                 zone_polygon=zone, line_start=line_start, line_end=line_end,
             ),
         )

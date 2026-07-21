@@ -33,11 +33,15 @@ class Detector:
         self._config = config
         self._keep_classes = sorted({config.person_class_id, config.phone_class_id})
         self._device = resolve_device(config.device)
+        # FP16 (half precision) is a free ~1.5-2x speedup on CUDA GPUs.
+        dev = self._device.lower()
+        self._use_half = ("cuda" in dev) or dev.isdigit()
         logger.info("Loading YOLO model from '%s' ...", config.model_path)
         # Ultralytics downloads the weight automatically if it is not present.
         self._model = YOLO(str(config.model_path))
         logger.info(
-            "Model loaded (device=%s, requested=%s).", self._device, config.device
+            "Model loaded (device=%s, requested=%s, half=%s).",
+            self._device, config.device, self._use_half,
         )
 
     def detect(self, frame: np.ndarray) -> sv.Detections:
@@ -48,6 +52,7 @@ class Detector:
             iou=self._config.iou_threshold,
             imgsz=self._config.inference_imgsz,
             device=self._device,
+            half=self._use_half,
             classes=self._keep_classes,
             verbose=False,
         )[0]
@@ -65,6 +70,7 @@ class Detector:
             iou=self._config.iou_threshold,
             imgsz=self._config.inference_imgsz,
             device=self._device,
+            half=self._use_half,
             classes=self._keep_classes,
             tracker=self._config.tracker_config,
             persist=self._config.persist_tracks,

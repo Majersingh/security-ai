@@ -146,7 +146,10 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const LIVE_FPS = 6;          // threshold basis for live mode (approx CPU rate)
+const LIVE_FPS = 6;          // threshold basis for live mode
+const MAX_INFLIGHT = 3;      // frames allowed in flight at once (hides latency)
+const SEND_W = 640;          // downscale camera frames to this width before sending
+let pending = 0;             // frames currently awaiting a result
 let eventCount = 0;
 
 /* ---------------- mode switching ---------------- */
@@ -300,9 +303,11 @@ async function enableCamera() {
   $("placeholder").classList.add("hidden");
   $("frame").classList.add("hidden");
   cam.onloadedmetadata = () => {
-    canvas.width = cam.videoWidth;
-    canvas.height = cam.videoHeight;
-    sizeDrawCanvas(cam.videoWidth, cam.videoHeight);   // enable drawing on the feed
+    // Capture canvas is downscaled to SEND_W to shrink the upload payload.
+    const scale = Math.min(1, SEND_W / cam.videoWidth);
+    canvas.width = Math.round(cam.videoWidth * scale);
+    canvas.height = Math.round(cam.videoHeight * scale);
+    sizeDrawCanvas(cam.videoWidth, cam.videoHeight);   // draw overlay at native size
   };
   $("startCam").disabled = false;
   $("startCam").classList.remove("hidden");   // was hidden by stopCamera()/setMode()
@@ -315,7 +320,7 @@ function startCameraScan() {
   if (!stream) return;
   resetLog();
   scanning = true;
-  liveFrame = 0; fpsTimes = [];
+  liveFrame = 0; fpsTimes = []; pending = 0;
   $("startCam").classList.add("hidden");
   $("stopCam").classList.remove("hidden");
   $("camStatus").textContent = "Loading model…";
@@ -330,13 +335,15 @@ function startCameraScan() {
     const d = JSON.parse(msg.data);
     if (d.type === "ready") {
       $("camStatus").textContent = "Scanning live feed…";
-      sendCameraFrame();                 // start the paced loop
+      // Prime the pipeline: keep several frames in flight so latency is hidden.
+      for (let k = 0; k < MAX_INFLIGHT; k++) sendCameraFrame();
     } else if (d.type === "result") {
+      pending = Math.max(0, pending - 1);
       showFrame(d.image);                // show annotated feed with boxes
       liveFrame++;
       updateLiveStats();
       (d.events || []).forEach(addEventRow);
-      if (scanning) sendCameraFrame();   // request next frame (paced by server)
+      if (scanning) sendCameraFrame();   // refill the in-flight window
     } else if (d.type === "error") {
       $("camStatus").textContent = "Error: " + d.message;
       stopCamera();
@@ -347,9 +354,11 @@ function startCameraScan() {
 
 function sendCameraFrame() {
   if (!scanning || !camWs || camWs.readyState !== WebSocket.OPEN) return;
+  if (pending >= MAX_INFLIGHT) return;   // window full; wait for a result
   ctx.drawImage($("cam"), 0, 0, canvas.width, canvas.height);
-  const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.5);
   camWs.send(JSON.stringify({ type: "frame", image: dataUrl }));
+  pending++;
 }
 
 function updateLiveStats() {
@@ -363,6 +372,7 @@ function updateLiveStats() {
 
 function stopCamera() {
   scanning = false;
+  pending = 0;
   if (camWs && camWs.readyState === WebSocket.OPEN) {
     try { camWs.send(JSON.stringify({ type: "stop" })); } catch (e) {}
     camWs.close();
