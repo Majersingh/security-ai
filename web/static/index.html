@@ -321,6 +321,8 @@ function startCameraScan() {
   resetLog();
   scanning = true;
   liveFrame = 0; fpsTimes = []; pending = 0;
+  $("cam").classList.remove("hidden");   // keep the smooth local video visible
+  $("frame").classList.add("hidden");
   $("startCam").classList.add("hidden");
   $("stopCam").classList.remove("hidden");
   $("camStatus").textContent = "Loading model…";
@@ -339,7 +341,7 @@ function startCameraScan() {
       for (let k = 0; k < MAX_INFLIGHT; k++) sendCameraFrame();
     } else if (d.type === "result") {
       pending = Math.max(0, pending - 1);
-      showFrame(d.image);                // show annotated feed with boxes
+      renderLiveOverlay(d.boxes || [], d.w, d.h);   // draw boxes over local video
       liveFrame++;
       updateLiveStats();
       (d.events || []).forEach(addEventRow);
@@ -485,6 +487,29 @@ function geometryMsg() {
 function clearDrawOverlay() {
   dctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
   drawCanvas.classList.remove("active");
+}
+
+// Live mode: draw server-returned boxes over the local video (client-side).
+function renderLiveOverlay(boxes, procW, procH) {
+  if (!procW || !procH) return;
+  const sx = drawCanvas.width / procW, sy = drawCanvas.height / procH;
+  redrawGeometry();                 // clears canvas + redraws the user's zone/line
+  dctx.lineWidth = 3;
+  dctx.font = "16px system-ui, sans-serif";
+  boxes.forEach((b) => {
+    const x = b.x1 * sx, y = b.y1 * sy, w = (b.x2 - b.x1) * sx, h = (b.y2 - b.y1) * sy;
+    const color = b.cls === "phone" ? "#58a6ff" : (b.violation ? "#f85149" : "#3fb950");
+    dctx.strokeStyle = color;
+    dctx.strokeRect(x, y, w, h);
+    const label = b.cls === "phone"
+      ? `Phone ${(b.conf || 0).toFixed(2)}`
+      : (b.violation ? `ID ${b.tid} ${b.label || ""}`.trim() : `ID ${b.tid}`);
+    const tw = dctx.measureText(label).width;
+    dctx.fillStyle = color;
+    dctx.fillRect(x, Math.max(0, y - 22), tw + 8, 20);
+    dctx.fillStyle = "#fff";
+    dctx.fillText(label, x + 4, Math.max(14, y - 7));
+  });
 }
 </script>
 </body>

@@ -248,14 +248,18 @@ async def live_ws(websocket: WebSocket) -> None:
             if frame is None:
                 continue
 
-            annotated, new_events = await loop.run_in_executor(
-                None, processor.process, frame, frame_index
+            boxes, new_events, w, h = await loop.run_in_executor(
+                None, processor.process_json, frame, frame_index
             )
+            # Return only lightweight JSON (boxes + events), no image. The browser
+            # draws these over its own local video, so the network carries ~1 KB.
             await websocket.send_json(
                 {
                     "type": "result",
                     "i": frame_index,
-                    "image": _encode_frame(annotated),
+                    "w": w,
+                    "h": h,
+                    "boxes": boxes,
                     "events": [asdict(e) for e in new_events],
                 }
             )

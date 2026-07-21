@@ -101,8 +101,8 @@ class FrameProcessor:
             processing_fps=self._processing_fps,
         )
 
-    def process(self, frame: np.ndarray, frame_index: int) -> Tuple[np.ndarray, List[Event]]:
-        """Run the full pipeline on one frame; return (annotated, new_events)."""
+    def _run(self, frame: np.ndarray, frame_index: int):
+        """Shared core: detect -> track -> rules. Returns raw results."""
         if self._engine is None:
             h, w = frame.shape[:2]
             self._build_engine(w, h)
@@ -110,10 +110,41 @@ class FrameProcessor:
         detections = self._detector.track(frame)
         persons, phones = self._tracker.route(detections)
         result = self._engine.process(persons, phones, frame_index, frame)
+        new_events = self._event_log.events[before:]
+        return persons, phones, result, new_events
+
+    def process(self, frame: np.ndarray, frame_index: int) -> Tuple[np.ndarray, List[Event]]:
+        """Run the pipeline and return an ANNOTATED frame (used for upload mode)."""
+        persons, phones, result, new_events = self._run(frame, frame_index)
         annotated = self._annotator.annotate(frame, persons, phones, result)
         self._engine.draw_overlays(annotated)  # zone/line overlays
-        new_events = self._event_log.events[before:]
         return annotated, new_events
+
+    def process_json(self, frame: np.ndarray, frame_index: int):
+        """Run the pipeline and return DETECTIONS as plain data (no image).
+
+        Used by live camera mode: the browser draws these boxes over its own
+        local video, so only a tiny JSON payload crosses the network.
+        Returns (boxes, new_events, width, height).
+        """
+        h, w = frame.shape[:2]
+        persons, phones, result, new_events = self._run(frame, frame_index)
+        boxes: List[dict] = []
+        for i in range(len(persons)):
+            tid = int(persons.tracker_id[i]) if persons.tracker_id is not None else -1
+            x1, y1, x2, y2 = (float(v) for v in persons.xyxy[i])
+            boxes.append({
+                "cls": "person", "tid": tid,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "violation": tid in result.violating_track_ids,
+                "label": result.labels.get(tid, ""),
+            })
+        for j in range(len(phones)):
+            x1, y1, x2, y2 = (float(v) for v in phones.xyxy[j])
+            conf = float(phones.confidence[j]) if phones.confidence is not None else 0.0
+            boxes.append({"cls": "phone", "conf": conf,
+                          "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        return boxes, new_events, w, h
 
     @property
     def event_log(self) -> EventLog:
