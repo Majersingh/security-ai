@@ -32,9 +32,11 @@ from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect  # noqa:
 from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
+from contextlib import asynccontextmanager  # noqa: E402
+
 from config import Config  # noqa: E402
 from streaming import FrameProcessor, StreamingScanner  # noqa: E402
-from utils import format_timestamp, setup_logging  # noqa: E402
+from utils import format_timestamp, resolve_device, setup_logging  # noqa: E402
 
 logger = setup_logging("INFO")
 
@@ -47,7 +49,39 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 STREAM_MAX_WIDTH = 960
 JPEG_QUALITY = 70
 
-app = FastAPI(title="CCTV Operator Monitoring - Live Scan")
+
+def _log_hardware() -> None:
+    """Log, at startup, which device inference will run on (GPU vs CPU)."""
+    device = resolve_device(Config().device)  # what "auto" resolves to
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            logger.info(
+                "GPU DETECTED: %s | CUDA %s | inference device=%s | FP16=ON",
+                name, torch.version.cuda, device,
+            )
+        elif device == "mps":
+            logger.info("Apple GPU (MPS) detected | inference device=mps")
+        else:
+            logger.warning(
+                "NO GPU detected — inference will run on CPU (slow). "
+                "Install a CUDA build of PyTorch and use a GPU host for real-time."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not query GPU info (%s); resolved device=%s", exc, device)
+
+
+@asynccontextmanager
+async def lifespan(app: "FastAPI"):
+    logger.info("Server starting up…")
+    _log_hardware()
+    yield
+    logger.info("Server shutting down.")
+
+
+app = FastAPI(title="CCTV Operator Monitoring - Live Scan", lifespan=lifespan)
 
 # Registry of uploaded jobs: job_id -> saved video path.
 _JOBS: dict[str, Path] = {}
