@@ -74,6 +74,14 @@
     padding: 6px 12px; font-size: 13px; }
   .drawbar .tool.on { border-color: var(--accent); background: #1c2333; }
   .drawbar .info { font-size: 12px; color: var(--muted); margin-left: 4px; }
+
+  /* loading spinner overlay (shown until the first result arrives) */
+  .spinner-overlay { position: absolute; inset: 0; z-index: 5; display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    background: rgba(13, 17, 23, 0.72); color: var(--text); font-size: 14px; text-align: center; }
+  .spinner { width: 46px; height: 46px; border: 4px solid rgba(255,255,255,0.15);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -109,6 +117,10 @@
         <video id="uploadPreview" muted playsinline class="hidden"></video>
         <img id="frame" class="hidden" />
         <canvas id="draw"></canvas>
+        <div class="spinner-overlay hidden" id="spinner">
+          <div class="spinner"></div>
+          <div id="spinnerText">Starting…</div>
+        </div>
       </div>
 
       <div class="drawbar">
@@ -166,7 +178,14 @@ function setMode(mode) {
 $("tabUpload").onclick = () => setMode("upload");
 $("tabCamera").onclick = () => setMode("camera");
 
+function showSpinner(text) {
+  $("spinnerText").textContent = text || "Loading…";
+  $("spinner").classList.remove("hidden");
+}
+function hideSpinner() { $("spinner").classList.add("hidden"); }
+
 function resetView() {
+  hideSpinner();
   $("frame").classList.add("hidden");
   $("cam").classList.add("hidden");
   $("uploadPreview").classList.add("hidden");
@@ -221,6 +240,8 @@ async function startUploadScan() {
   $("scanBtn").disabled = true;
   $("uploadStatus").textContent = "Uploading…";
   resetView();
+  showSpinner("Uploading video…");
+  let first = true;
 
   const form = new FormData();
   form.append("file", selectedFile);
@@ -231,10 +252,12 @@ async function startUploadScan() {
   } catch (err) {
     $("uploadStatus").textContent = "Upload failed: " + err;
     $("scanBtn").disabled = false;
+    hideSpinner();
     return;
   }
 
   $("uploadStatus").textContent = "Scanning…";
+  showSpinner("Loading model & warming up…");
   $("stage").classList.add("scanning");
   $("liveBadge").classList.remove("hidden");
   $("placeholder").classList.add("hidden");
@@ -248,6 +271,7 @@ async function startUploadScan() {
     if (d.type === "meta") {
       $("frameTxt").textContent = `frame 0 / ${d.total_frames}`;
     } else if (d.type === "frame") {
+      if (first) { hideSpinner(); first = false; }
       showFrame(d.image);
       $("bar").style.width = d.progress + "%";
       $("progressTxt").textContent = d.progress + "%";
@@ -274,6 +298,7 @@ function showFrame(b64) {
   clearDrawOverlay();   // server now draws the zone/line into the frame
 }
 function endScan(text, statusId) {
+  hideSpinner();
   $(statusId).textContent = text;
   $("scanBtn").disabled = false;
   $("stage").classList.remove("scanning");
@@ -326,6 +351,7 @@ function startCameraScan() {
   $("startCam").classList.add("hidden");
   $("stopCam").classList.remove("hidden");
   $("camStatus").textContent = "Loading model…";
+  showSpinner("Loading model & warming up…");
   $("stage").classList.add("scanning");
   $("liveBadge").classList.remove("hidden");
 
@@ -340,6 +366,7 @@ function startCameraScan() {
       // Prime the pipeline: keep several frames in flight so latency is hidden.
       for (let k = 0; k < MAX_INFLIGHT; k++) sendCameraFrame();
     } else if (d.type === "result") {
+      hideSpinner();                                // first detection is in
       pending = Math.max(0, pending - 1);
       renderLiveOverlay(d.boxes || [], d.w, d.h);   // draw boxes over local video
       liveFrame++;
@@ -375,6 +402,7 @@ function updateLiveStats() {
 function stopCamera() {
   scanning = false;
   pending = 0;
+  hideSpinner();
   if (camWs && camWs.readyState === WebSocket.OPEN) {
     try { camWs.send(JSON.stringify({ type: "stop" })); } catch (e) {}
     camWs.close();
