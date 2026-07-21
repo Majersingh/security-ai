@@ -235,28 +235,55 @@ $("file").addEventListener("change", (e) => {
 });
 $("scanBtn").addEventListener("click", startUploadScan);
 
+// Upload with progress (fetch can't report upload %, XHR can).
+function uploadVideo(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/upload");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded, e.total);
+    };
+    xhr.onload = () =>
+      (xhr.status >= 200 && xhr.status < 300)
+        ? resolve(JSON.parse(xhr.responseText))
+        : reject(new Error("HTTP " + xhr.status));
+    xhr.onerror = () => reject(new Error("network error"));
+    const form = new FormData();
+    form.append("file", file);
+    xhr.send(form);
+  });
+}
+
+function fmtMB(bytes) { return (bytes / 1048576).toFixed(1); }
+
 async function startUploadScan() {
   if (!selectedFile) return;
   $("scanBtn").disabled = true;
   $("uploadStatus").textContent = "Uploading…";
   resetView();
-  showSpinner("Uploading video…");
+  showSpinner("Uploading video… 0%");
+  $("bar").style.width = "0%";
   let first = true;
 
-  const form = new FormData();
-  form.append("file", selectedFile);
   let job;
   try {
-    const res = await fetch("/upload", { method: "POST", body: form });
-    job = await res.json();
+    job = await uploadVideo(selectedFile, (loaded, total) => {
+      const pct = Math.round((100 * loaded) / total);
+      showSpinner(`Uploading video… ${pct}% (${fmtMB(loaded)} / ${fmtMB(total)} MB)`);
+      $("uploadStatus").textContent = `Uploading… ${pct}%`;
+      $("bar").style.width = pct + "%";
+      $("progressTxt").textContent = "upload " + pct + "%";
+    });
   } catch (err) {
-    $("uploadStatus").textContent = "Upload failed: " + err;
+    $("uploadStatus").textContent = "Upload failed: " + err.message;
     $("scanBtn").disabled = false;
     hideSpinner();
     return;
   }
 
   $("uploadStatus").textContent = "Scanning…";
+  $("bar").style.width = "0%";
+  $("progressTxt").textContent = "0%";
   showSpinner("Loading model & warming up…");
   $("stage").classList.add("scanning");
   $("liveBadge").classList.remove("hidden");
