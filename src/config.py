@@ -1,8 +1,8 @@
 """Central configuration for the CCTV Operator Monitoring System.
 
 Every tunable value lives here. No other module hard-codes paths, thresholds,
-colours or class ids. Values can be overridden at runtime via CLI flags in
-``main.py`` (which mutate a :class:`Config` instance before the pipeline runs).
+colours or class ids. The web server constructs a :class:`Config` per feed and
+may tweak a few fields (e.g. ``inference_imgsz``) before the pipeline runs.
 
 Thresholds are expressed in *seconds* rather than frames. The pipeline converts
 them to a frame count using the video's real FPS, so behaviour is consistent
@@ -88,6 +88,15 @@ class Config:
 
     # --------------------------------------------------------------- runtime
     log_level: str = "INFO"
+
+    # ------------------------------------------------- multi-feed (concurrent)
+    # One YOLO model is loaded PER feed because the tracker state lives on the
+    # model object (see detector.track persist=True), so feeds cannot share one.
+    # VRAM therefore caps how many feeds run at once.
+    max_feeds: int = 8
+    # Inference across all feeds is serialized by a shared GPU gate this many
+    # deep, so N concurrent feeds don't thrash the single GPU.
+    max_concurrent_inferences: int = 2
 
     # Human-readable event label, kept here so wording is not scattered around.
     event_labels: dict = field(

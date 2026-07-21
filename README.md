@@ -1,12 +1,15 @@
-# AI-Powered CCTV Operator Monitoring System (PoC)
+# AI-Powered CCTV Operator Monitoring System
 
-A proof-of-concept that analyses CCTV footage of a control-room operator and
-detects **mobile phone usage while on duty**. It detects and tracks people,
-associates phones with a tracked operator, and produces an annotated video, an
-events CSV and per-violation snapshots.
+Monitors **live camera streams** (RTSP / HLS / HTTP) of control-room operators
+and detects **mobile phone usage on duty**, plus optional **zone-intrusion** and
+**line-crossing** rules drawn on each stream. It detects and tracks people,
+associates phones with tracked operators, and streams annotated frames + a live
+events feed to a web dashboard. Many streams run concurrently on a single GPU.
 
-> **Milestone 1 scope:** person detection, phone detection, person tracking,
-> phone-usage detection, annotated video, events CSV, violation snapshots.
+Artefacts kept: per-feed violation snapshots + `events.csv` under
+`output/<feed_id>/`. Video itself is **never stored**.
+
+> **Behaviours implemented:** phone-usage, zone-intrusion, line-crossing.
 > Sleeping / gaze / absence detection are intentionally **not** implemented yet
 > (see [Future Improvements](#future-improvements)).
 
@@ -18,10 +21,13 @@ The pipeline is deliberately modular — one responsibility per file — so late
 phases plug in without touching the core loop:
 
 ```
-main.py         VideoProcessor: opens video, drives the loop, writes outputs
+web/server.py   FastAPI: /feeds/* REST + WebSocket transport (stream-only)
+sources.py      StreamURLSource: PyAV decode of RTSP/HLS/HTTP (drop-to-latest)
+feeds.py        Feed + FeedManager: concurrent feeds on one GPU (shared gate)
+streaming.py    FrameProcessor: per-frame detect -> track -> rules -> annotate
 detector.py     Detector:       YOLOv11 -> person + phone detections only
 tracker.py      Tracker:        ByteTrack -> persistent person IDs
-behavior.py     BehaviorEngine + BehaviorRule + PhoneUsageRule
+behavior.py     BehaviorEngine + BehaviorRule + PhoneUsageRule / Zone / Line
                                 business logic, debounced into episodes
 annotator.py    Annotator:      draws green/blue/red boxes + labels
 events.py       EventLog + SnapshotManager: CSV + JPEG persistence
@@ -29,8 +35,10 @@ config.py       Config:         every tunable value (typed dataclass)
 utils.py        logging, geometry (IoU/containment), timestamp helpers
 ```
 
-**Extensibility:** to add a Phase-2 behaviour (e.g. sleeping), implement a new
-`BehaviorRule` subclass and register it in the `rules=[...]` list in `main.py`.
+See `docs/ARCHITECTURE.md` for the multi-feed / single-GPU design in depth.
+
+**Extensibility:** to add a new behaviour (e.g. sleeping), implement a new
+`BehaviorRule` subclass and register it in `build_rules()` (`behavior.py`).
 No other file changes. The debounce/episode logic, event logging and snapshots
 are handled generically for every rule.
 
@@ -62,46 +70,48 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-This installs Ultralytics (YOLOv11), Supervision (ByteTrack + annotators),
-OpenCV, NumPy and Pandas. The YOLOv11 weight (`yolo11n.pt`) is downloaded
-automatically on first run and cached in `models/`.
+This installs the full stack — Ultralytics (YOLOv11), Supervision (ByteTrack +
+annotators), OpenCV, PyAV (stream decode), NumPy, Pandas, and the web server
+(FastAPI + uvicorn) — from the single `requirements.txt`. The YOLOv11 weight
+(`yolo11n.pt`) is downloaded automatically on first run and cached in `models/`.
 
-> GPU is optional. Default device is `cpu`; pass `--device 0` for CUDA or
-> `--device mps` on Apple Silicon.
+> GPU strongly recommended for real-time multi-stream inference. Device is
+> auto-detected (`Config.device = "auto"` → CUDA / MPS / CPU).
 
 ---
 
 ## Running
 
-
-Place your MP4 at `input/operator.mp4`, then:
-
-```bash
-python src/main.py
-```
-
-Common overrides (no code edits needed):
+Start the server:
 
 ```bash
-python src/main.py --input input/operator.mp4 \
-                   --device 0 \
-                   --conf 0.4 \
-                   --start-seconds 1.5
-python src/main.py --no-video          # CSV + snapshots only (faster)
-python src/main.py --log-level DEBUG
+PYTHONPATH=src .venv/bin/python -m uvicorn --app-dir web server:app \
+    --host 0.0.0.0 --port 8000
 ```
+
+Open `http://localhost:8000`, paste a camera **stream URL** (RTSP / HLS / HTTP)
+and click **Add Stream**. Each stream runs as its own feed; draw a **line** or
+**zone** on a connected stream to add tripwire / intrusion rules. Detected
+violations appear in the events panel and are saved as per-feed snapshots +
+`events.csv` under `output/<feed_id>/`. Nothing else is stored.
+
+REST/WS API: `GET /feeds`, `POST /feeds/stream {url}`, `POST /feeds/{id}/stop`,
+`POST /feeds/{id}/geometry`, `WS /feeds/{id}/subscribe`.
 
 ---
 
 ## Expected Output
 
+Per feed, under `output/<feed_id>/`:
+
 ```
-output/
-  annotated.mp4          # video with green (person) / blue (phone) / red (violation) boxes
+output/<feed_id>/
   events.csv             # one row per confirmed violation episode
   snapshots/
     phone_000123.jpg     # JPEG evidence, named <prefix>_<frame>.jpg
 ```
+
+Annotated frames are streamed to the dashboard live; **no video is stored**.
 
 `events.csv` columns:
 
@@ -115,61 +125,30 @@ output/
 
 ```
 security-ai/
-  input/            operator.mp4          (source video)
-  output/           annotated.mp4, events.csv, snapshots/
+  output/           <feed_id>/{events.csv, snapshots/}   (per-feed artefacts)
   models/           yolo11n.pt            (auto-downloaded weights)
-  src/              main, detector, tracker, behavior, annotator, events, config, utils
+  src/              detector, tracker, behavior, annotator, events, config,
+                    utils, streaming (FrameProcessor), sources, feeds
+  web/              server.py (FastAPI), static/index.html (dashboard)
+  docs/             ARCHITECTURE.md
   requirements.txt
-  README.md
+  README.md         SETUP.md
 ```
 
 ---
 
-## Web UI (live streaming scan)
+## How it works
 
-Two input modes, chosen with a toggle on the page:
+A stream URL is opened by `StreamURLSource` (PyAV) and processed frame by frame
+through `FrameProcessor` (`Detector` → `Tracker` → `BehaviorEngine` →
+`Annotator`). Each stream is a `Feed`; `FeedManager` runs many feeds concurrently
+and **serializes GPU inference behind a shared semaphore** so one GPU is shared
+cleanly. Live streams use **drop-to-latest** (skip stale frames to bound latency)
+and **auto-reconnect**. The browser subscribes over a WebSocket and receives
+annotated JPEG frames + events; drawn zone/line geometry is pushed back with
+`POST /feeds/{id}/geometry` and applied on the next frame.
 
-1. **📁 Upload Video** — upload a file and watch it scanned frame-by-frame.
-2. **📹 Live Camera** — scan your webcam feed in real time.
-
-```bash
-pip install -r requirements-web.txt
-python -m uvicorn web.server:app --host 0.0.0.0 --port 8000 --app-dir .
-```
-
-Then open <http://localhost:8000>.
-
-### How it works
-
-Both modes reuse the **same** CV pipeline via `FrameProcessor` in
-`src/streaming.py` (which wraps `Detector`/`Tracker`/`BehaviorEngine`/
-`Annotator`). Only the frame *source* differs:
-
-| Mode | Endpoint | Frame source |
-|------|----------|--------------|
-| Upload | `POST /upload` → WS `/ws/{job_id}` | server reads the uploaded file |
-| Camera | WS `/ws-live` | browser captures frames and pushes them up |
-
-For the camera, the browser grabs frames with `getUserMedia`, sends each one as
-a JPEG over the WebSocket, the server runs the pipeline and returns the
-annotated frame + any events. Sending is **paced** (one frame in flight at a
-time), so it naturally throttles to the server's processing speed.
-
-> ⚠️ **Camera access requires a secure context.** Browsers only allow
-> `getUserMedia` on `https://` **or** `http://localhost`. Over a plain-HTTP LAN
-> IP the camera button will be blocked — deploy behind HTTPS (e.g. a Cloudflare
-> tunnel or a TLS reverse proxy) for the camera mode to work remotely. Upload
-> mode works over plain HTTP.
-
-> On CPU, inference is ~2–5 fps at 1440p, so the preview plays in slow motion —
-> which reads naturally as "scanning". A GPU (`device` in `config.py`) makes it
-> real-time.
-
-```
-web/
-  server.py          FastAPI: /upload, /ws/{job_id}, /ws-live, serves the UI
-  static/index.html  single-page front-end (mode toggle, live video, event log)
-```
+See `docs/ARCHITECTURE.md` for the full design.
 
 ## Zone & line detection (intrusion + crossing)
 
@@ -187,30 +166,17 @@ registered automatically by `build_rules()` when geometry is provided — no
 pipeline changes. Events land in the same `events.csv` (`Zone Intrusion`,
 `Line Crossing (in)`/`(out)`), with snapshots.
 
-### Define geometry by drawing in the browser (recommended)
+### Define geometry by drawing on a live stream
 
-In the web UI, use the **Draw detection area** toolbar under the video:
+On each connected stream tile, use the **Line / Zone / Clear** tools:
 
-1. Pick a video (or enable the camera) — the first frame appears.
-2. Click **Line** and click 2 points, and/or **Zone**, click ≥3 points, then
-   **Finish Zone**. **Clear** removes them.
-3. Start the scan. The drawn coordinates are sent to the server, which runs the
-   rules and draws the zone/line onto the output.
-
-### Define geometry in config (fixed camera)
-
-Coordinates are in native frame pixels:
-
-```python
-# src/config.py
-zone_polygon = [(400, 200), (900, 200), (900, 700), (400, 700)]
-line_start   = (0, 500)
-line_end     = (1280, 500)
-```
+1. Click **Line** and click 2 points, and/or **Zone**, click ≥3 points, then
+   **Finish**. **Clear** removes them.
+2. The drawn (normalized) coordinates are sent via `POST /feeds/{id}/geometry`;
+   the feed rebuilds its rules on the next frame and the annotated stream then
+   shows the zone/line and fires intrusion / crossing events.
 
 ## Tuning knobs (where to change behaviour)
-
-All values live in `src/config.py`; the common ones also have CLI flags.
 
 **When is a "Mobile Phone Usage" event logged?**
 A single phone detection is *not* enough. A phone must stay near the person
@@ -218,44 +184,40 @@ A single phone detection is *not* enough. A phone must stay near the person
 event fires for the whole episode. The episode ends after
 `violation_end_seconds` (1.5 s) without the phone.
 
-| Knob (`config.py`) | Default | Effect | CLI |
-|---|---|---|---|
-| `violation_start_seconds` | 1.0 | How long the phone must be used before logging | `--start-seconds` |
-| `violation_end_seconds` | 1.5 | Gap of no-phone that ends an episode | — |
-| `confidence_threshold` | 0.25 | Min detection score | `--conf` |
-| `proximity_margin` | 0.15 | Person box inflation when testing "near" | — |
-| `min_containment` | 0.30 | Fraction of phone inside person to count | — |
-| `snapshot_cooldown_seconds` | 5.0 | Gap between snapshots in one episode | — |
-| `inference_imgsz` | 1280 | Detection resolution (accuracy vs speed) | — |
-| `frame_stride` | 1 | Analyse every Nth frame (speed) | `--frame-stride` |
+All knobs live in `config.py` (a typed dataclass); the web server tweaks a few
+per feed (e.g. `inference_imgsz`).
 
-**Frame sampling (`frame_stride`).** To analyse fewer frames on a 30 fps video:
+| Knob (`config.py`) | Default | Effect |
+|---|---|---|
+| `violation_start_seconds` | 1.0 | How long the phone must be used before logging |
+| `violation_end_seconds` | 1.5 | Gap of no-phone that ends an episode |
+| `confidence_threshold` | 0.25 | Min detection score |
+| `proximity_margin` | 0.15 | Person box inflation when testing "near" |
+| `min_containment` | 0.30 | Fraction of phone inside person to count |
+| `snapshot_cooldown_seconds` | 5.0 | Gap between snapshots in one episode |
+| `inference_imgsz` | 1280 | Detection resolution (accuracy vs speed); the server uses 640 for live streams |
+| `max_feeds` | 8 | Max concurrent feeds (VRAM ceiling) |
+| `max_concurrent_inferences` | 2 | GPU gate depth shared across all feeds |
 
-```bash
-python src/main.py --frame-stride 30    # ~1 analysed frame per second (~30x faster)
-python src/main.py --frame-stride 5     # every 5th frame (~5x faster)
-```
-
-Time-based thresholds **auto-adjust** to the effective rate (`fps / stride`), so
-"1 second of phone use" still means 1 real second regardless of stride. Event
-timestamps also stay accurate to the original video time. Trade-off: higher
-stride = coarser timing and slightly less stable tracking IDs during fast
-motion. Also honoured by the web UI's upload mode.
+Time-based thresholds are expressed in **seconds** and converted to frames using
+each stream's real FPS, so "1 second of phone use" means 1 real second across
+15/25/30 fps sources.
 
 ## Tuning notes (accuracy)
 
 - **Detection resolution matters on high-res footage.** In 2560×1440 CCTV a
   phone is a very small object. At the default YOLO `imgsz=640` the nano model
   detected **0** phones; at `imgsz=1280` it detected the phone in ~93% of
-  sampled frames. `inference_imgsz` therefore defaults to `1280`. Lower it for
-  speed on low-res footage, raise it if phones are still missed.
+  sampled frames. `inference_imgsz` therefore defaults to `1280` (the server
+  uses `640` for live streams, where subjects are closer). Raise it if phones
+  are missed.
 - **Model size.** `yolo11n` (nano) is the fastest and auto-downloaded default.
-  For better small-object recall swap to `yolo11s`/`yolo11m` via
-  `--model models/yolo11m.pt` (Ultralytics downloads it automatically).
-- **Confidence / thresholds.** `--conf`, `--start-seconds` and the proximity
-  values in `config.py` trade sensitivity against false positives.
-- **Speed.** CPU inference on 1440p is ~2–5 fps. Use `--device 0` (CUDA) or
-  `--device mps` (Apple) for real-time-class throughput.
+  For better small-object recall set `model_path` to `yolo11s`/`yolo11m` in
+  `config.py` (Ultralytics downloads it automatically).
+- **Confidence / thresholds.** `confidence_threshold`, `violation_start_seconds`
+  and the proximity values in `config.py` trade sensitivity against false positives.
+- **Speed.** A CUDA GPU is strongly recommended for real-time multi-stream
+  inference; CPU is fine only for a single low-fps stream.
 
 ## Future Improvements
 

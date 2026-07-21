@@ -50,10 +50,7 @@ python -m pip install --upgrade pip
 ## 4. Install dependencies
 
 ```bash
-# Web UI (upload + live camera) — includes the core CV stack:
-pip install -r requirements-web.txt
-
-# ...or CLI only:
+# Web server + core CV stack (FastAPI, uvicorn, PyAV, Ultralytics, …):
 pip install -r requirements.txt
 ```
 
@@ -63,32 +60,22 @@ over manually.
 
 ---
 
-## 5. Add a video (for file mode)
+## 5. Have a stream URL ready
 
-Place a video at:
-```
-input/operator.mp4
-```
-Not required if you only use **Live Camera** mode in the web UI.
+You'll need a reachable camera stream URL (RTSP / HLS / HTTP), e.g.
+`rtsp://user:pass@camera-host:554/stream`. No local video file is needed.
 
 ---
 
 ## 6. Run
 
-### Web UI (upload + live camera)
 ```bash
-python -m uvicorn web.server:app --host 0.0.0.0 --port 8000 --app-dir .
+PYTHONPATH=src python -m uvicorn --app-dir web server:app --host 0.0.0.0 --port 8000
 ```
-Open **http://localhost:8000** — toggle between *Upload Video* and *Live Camera*.
-
-### CLI (batch → annotated.mp4 + events.csv + snapshots)
-```bash
-python src/main.py                       # uses input/operator.mp4
-python src/main.py --input path/to/video.mp4
-python src/main.py --device cpu          # force CPU
-python src/main.py --no-video            # CSV + snapshots only (faster)
-```
-Outputs land in `output/` (`annotated.mp4`, `events.csv`, `snapshots/`).
+Open **http://localhost:8000**, paste a camera **stream URL** (RTSP / HLS / HTTP)
+and click **Add Stream**. Draw a line/zone on a connected stream to add
+tripwire / intrusion rules. Per-feed snapshots + `events.csv` land under
+`output/<feed_id>/`; the video itself is never stored.
 
 ---
 
@@ -103,8 +90,8 @@ The device is **auto-detected** (config default `device = "auto"`):
 On startup the log prints which device was chosen, e.g.
 `Model loaded (device=cuda:0, requested=auto)`.
 
-**To force a device** (CLI): `python src/main.py --device cpu` or `--device 0`.
-**For the web UI**, edit `device` in `src/config.py` if you need to override auto.
+**To force a device**, edit `device` in `src/config.py` (`"cpu"`, `"0"`, `"mps"`)
+if you need to override auto-detection.
 
 ### Making sure the GPU is actually available
 ```bash
@@ -126,9 +113,8 @@ mid/high GPU well above real-time.
 | Symptom | Fix |
 |---------|-----|
 | `ImportError: libGL.so.1` (Linux) | `sudo apt install -y libgl1 libglib2.0-0` |
-| Camera button does nothing / blocked | Browsers allow camera only on `https://` or `http://localhost`. Use localhost, or serve over HTTPS (e.g. a Cloudflare tunnel). |
-| `Input video not found` | Put a file at `input/operator.mp4` or pass `--input`. |
-| Phone never detected | High-res footage needs `inference_imgsz=1280` (already the default); try a larger model with `--model yolo11s.pt`. |
+| `could not open stream` | Check the URL/credentials and that the host is reachable; RTSP uses TCP transport with a 5s timeout. |
+| Phone never detected | Raise `inference_imgsz` in `config.py`, or set `model_path` to a larger model (`yolo11s.pt`). |
 | First run hangs at start | It's downloading the model weight — needs internet once. |
 | GPU not used | `torch.cuda.is_available()` is `False` → install a CUDA build of PyTorch (see above). |
 
@@ -140,8 +126,7 @@ mid/high GPU well above real-time.
 git clone <your-repo-url> security-ai && cd security-ai
 python3 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements-web.txt
-# add input/operator.mp4 (optional if using camera)
-python -m uvicorn web.server:app --host 0.0.0.0 --port 8000 --app-dir .
-# open http://localhost:8000
+pip install -r requirements.txt
+PYTHONPATH=src python -m uvicorn --app-dir web server:app --host 0.0.0.0 --port 8000
+# open http://localhost:8000, then add a stream URL
 ```

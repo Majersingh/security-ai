@@ -1,27 +1,18 @@
-"""Streaming pipeline: a reusable per-frame processor plus two drivers.
+"""Per-frame processing core for the live-stream pipeline.
 
-* :class:`FrameProcessor` -- the shared core. Wraps detector / tracker /
-  behaviour engine / annotator and processes ONE frame at a time, returning the
-  annotated frame and any events that fired on it. Tracking state persists
-  across calls, so it works equally well for sequential video frames or a live
-  camera feed.
-* :class:`StreamingScanner` -- drives the processor over an uploaded video file
-  and *yields* results (used by the ``/ws/{job_id}`` endpoint).
-* Live camera scanning uses :class:`FrameProcessor` directly: the server feeds
-  it frames pushed from the browser (``/ws/live`` endpoint).
-
-The heavy CV work is identical to ``main.VideoProcessor``; only the frame source
-and output sink differ.
+:class:`FrameProcessor` wraps detector / tracker / behaviour engine / annotator
+and processes ONE frame at a time, returning either an annotated frame or plain
+detection data plus any events that fired. Tracking state persists across calls,
+so it drives a live stream frame by frame. It is used by :mod:`feeds`, which owns
+one processor (and thus one model) per feed.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from dataclasses import asdict
+from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 from annotator import Annotator
@@ -37,19 +28,8 @@ logger = logging.getLogger("operator_monitor")
 Point = Tuple[int, int]
 
 
-@dataclass
-class ScanUpdate:
-    """One processed frame handed back to the caller (server)."""
-
-    frame_index: int
-    total_frames: int
-    fps: float
-    annotated: np.ndarray          # BGR frame with boxes drawn
-    new_events: List[Event]        # events that fired on THIS frame (usually 0)
-
-
 class FrameProcessor:
-    """Stateful, single-frame pipeline shared by video and live camera modes."""
+    """Stateful, single-frame pipeline (one model + tracker per instance)."""
 
     def __init__(
         self,
@@ -76,6 +56,14 @@ class FrameProcessor:
         self._norm_line_start = line_start
         self._norm_line_end = line_end
         self._engine: Optional[BehaviorEngine] = None  # built on first frame
+        # Geometry drawn on a running feed lands here (a single atomic reference
+        # assignment from another thread), applied at the start of the next frame.
+        self._pending_geom: Optional[tuple] = None
+
+    def set_geometry(self, zone_polygon, line_start, line_end) -> None:
+        """Update the detection zone/line on a *running* processor (normalized
+        0..1 coords). The behaviour engine is rebuilt on the next frame."""
+        self._pending_geom = (zone_polygon, line_start, line_end)
 
     def _build_engine(self, width: int, height: int) -> None:
         def poly_px(poly):
@@ -103,6 +91,11 @@ class FrameProcessor:
 
     def _run(self, frame: np.ndarray, frame_index: int):
         """Shared core: detect -> track -> rules. Returns raw results."""
+        pending = self._pending_geom
+        if pending is not None:                       # geometry changed at runtime
+            self._pending_geom = None
+            self._norm_zone, self._norm_line_start, self._norm_line_end = pending
+            self._engine = None                       # force rebuild below
         if self._engine is None:
             h, w = frame.shape[:2]
             self._build_engine(w, h)
@@ -157,68 +150,3 @@ class FrameProcessor:
     def finalize(self) -> None:
         """Flush the events CSV. Safe to call once at the end of a session."""
         self._event_log.save()
-
-
-class StreamingScanner:
-    """Drives :class:`FrameProcessor` over an uploaded video file."""
-
-    def __init__(
-        self,
-        config: Config,
-        video_path: Path,
-        zone_polygon: Optional[List[Point]] = None,
-        line_start: Optional[Point] = None,
-        line_end: Optional[Point] = None,
-    ) -> None:
-        self._config = config
-        config.input_video = Path(video_path)
-
-        if not config.input_video.exists():
-            raise FileNotFoundError(f"Input video not found: {config.input_video}")
-        self._capture = cv2.VideoCapture(str(config.input_video))
-        if not self._capture.isOpened():
-            raise IOError(f"Could not open video: {config.input_video}")
-
-        self.fps = self._capture.get(cv2.CAP_PROP_FPS) or 30.0
-        self.width = int(self._capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self._capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.total_frames = int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        self._stride = max(1, config.frame_stride)
-        self._proc = FrameProcessor(
-            config, self.fps, processing_fps=self.fps / self._stride,
-            zone_polygon=zone_polygon, line_start=line_start, line_end=line_end,
-        )
-
-    def scan(self) -> Iterator[ScanUpdate]:
-        """Generator over processed frames."""
-        frame_index = 0
-        try:
-            while True:
-                ok, frame = self._capture.read()
-                if not ok:
-                    break
-                if frame_index % self._stride != 0:
-                    frame_index += 1
-                    continue
-                annotated, new_events = self._proc.process(frame, frame_index)
-                yield ScanUpdate(
-                    frame_index=frame_index,
-                    total_frames=self.total_frames,
-                    fps=self.fps,
-                    annotated=annotated,
-                    new_events=new_events,
-                )
-                frame_index += 1
-        finally:
-            self._capture.release()
-            self._proc.finalize()
-            logger.info("Streaming scan finished: %d event(s).", len(self._proc.event_log))
-
-    @property
-    def event_dicts(self) -> List[dict]:
-        return self._proc.event_dicts
-
-    def close(self) -> None:
-        if self._capture.isOpened():
-            self._capture.release()

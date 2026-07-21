@@ -10,8 +10,8 @@ Design
   an :class:`Event` is emitted, and must be absent for ``violation_end_seconds``
   before the episode is considered over. This prevents duplicate/noisy events.
 
-To add a Phase-2 behaviour: implement a new ``BehaviorRule`` and register it in
-``main.py``. No other file needs to change.
+To add a new behaviour: implement a new ``BehaviorRule`` and register it in
+:func:`build_rules`. No other file needs to change.
 """
 
 from __future__ import annotations

@@ -1,53 +1,45 @@
-"""FastAPI server for the live streaming operator-monitoring UI.
+"""FastAPI server for the multi-feed live-stream monitoring UI.
 
-Flow
-----
-1. Browser POSTs a video to ``/upload`` -> saved under ``uploads/`` -> job_id.
-2. Browser opens WebSocket ``/ws/{job_id}``.
-3. Server runs :class:`streaming.StreamingScanner`, and for every processed
-   frame pushes a JSON message containing a base64 JPEG of the annotated frame,
-   progress, and any events that just fired. The browser renders it live.
+The system processes **live stream URLs** (RTSP / HLS / HTTP). Each stream is a
+background :class:`feeds.Feed` that decodes with PyAV, runs detection through a
+shared GPU gate, and broadcasts annotated frames + events to any viewers.
 
+Endpoints
+---------
+* ``GET  /feeds``                  -- snapshot of all active feeds.
+* ``POST /feeds/stream {url}``     -- start a feed from a stream URL.
+* ``POST /feeds/{id}/stop``        -- stop a feed.
+* ``WS   /feeds/{id}/subscribe``   -- watch a feed's annotated frames + events.
+
+Nothing is stored except event snapshots and per-feed ``events.csv``.
 Only the transport lives here; all CV logic is reused from ``src/``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import sys
-import uuid
-from dataclasses import asdict
 from pathlib import Path
-
-import cv2
-import numpy as np
 
 # Make the CV package importable.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect  # noqa: E402
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from contextlib import asynccontextmanager  # noqa: E402
 
 from config import Config  # noqa: E402
-from streaming import FrameProcessor, StreamingScanner  # noqa: E402
-from utils import format_timestamp, resolve_device, setup_logging  # noqa: E402
+from feeds import FeedManager  # noqa: E402
+from sources import StreamURLSource  # noqa: E402
+from utils import resolve_device, setup_logging  # noqa: E402
 
 logger = setup_logging("INFO")
 
-UPLOAD_DIR = ROOT / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-
-# Frames are downscaled to this width before JPEG encoding, to keep the
-# WebSocket payload small (display quality only; detection still runs full-res).
-STREAM_MAX_WIDTH = 960
-JPEG_QUALITY = 70
 
 
 def _log_hardware() -> None:
@@ -77,65 +69,39 @@ def _log_hardware() -> None:
 async def lifespan(app: "FastAPI"):
     logger.info("Server starting up…")
     _log_hardware()
+    # One manager for the whole process: registry + shared GPU gate. Built here
+    # so the semaphore binds to the running event loop.
+    app.state.feeds = FeedManager(Config())
     yield
     logger.info("Server shutting down.")
 
 
-app = FastAPI(title="CCTV Operator Monitoring - Live Scan", lifespan=lifespan)
-
-# Registry of uploaded jobs: job_id -> saved video path.
-_JOBS: dict[str, Path] = {}
+app = FastAPI(title="CCTV Operator Monitoring - Live Streams", lifespan=lifespan)
 
 
-@app.post("/upload")
-async def upload(file: UploadFile) -> JSONResponse:
-    """Save an uploaded video and return a job id."""
-    suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
-    job_id = uuid.uuid4().hex
-    dest = UPLOAD_DIR / f"{job_id}{suffix}"
-
-    size = 0
-    with dest.open("wb") as out:
-        while chunk := await file.read(1 << 20):  # 1 MB chunks
-            out.write(chunk)
-            size += len(chunk)
-
-    _JOBS[job_id] = dest
-    logger.info("Uploaded %s (%.1f MB) -> job %s", file.filename, size / 1e6, job_id)
-    return JSONResponse({"job_id": job_id, "filename": file.filename})
+@app.get("/feeds")
+async def list_feeds() -> dict:
+    """Snapshot of all active feeds (for the dashboard)."""
+    mgr: FeedManager = app.state.feeds
+    return {"feeds": mgr.list(), "active": mgr.count(), "max_feeds": mgr.max_feeds}
 
 
-def _encode_frame(frame) -> str:
-    """Downscale + JPEG-encode a BGR frame into a base64 data string."""
-    h, w = frame.shape[:2]
-    if w > STREAM_MAX_WIDTH:
-        scale = STREAM_MAX_WIDTH / w
-        frame = cv2.resize(frame, (STREAM_MAX_WIDTH, int(h * scale)))
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    if not ok:
-        return ""
-    return base64.b64encode(buf.tobytes()).decode("ascii")
-
-
-def _decode_frame(data_url: str):
-    """Decode a base64 (data-URL or bare) JPEG string into a BGR frame."""
-    b64 = data_url.split(",", 1)[-1]  # strip "data:image/jpeg;base64," if present
-    raw = base64.b64decode(b64)
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+@app.post("/feeds/{feed_id}/stop")
+async def stop_feed(feed_id: str) -> dict:
+    """Ask a running feed to stop."""
+    mgr: FeedManager = app.state.feeds
+    return {"stopped": mgr.stop(feed_id), "feed_id": feed_id}
 
 
 def _parse_geometry(msg: dict):
     """Extract (zone_polygon, line_start, line_end) from a client message.
 
-    Coordinates are *normalized* (0..1 fractions of the frame width/height), so
-    they are resolution-independent; the pipeline scales them to pixels once it
-    knows the real frame size. Missing/invalid parts return None so the
-    corresponding rule is simply not registered.
+    Coordinates are *normalized* (0..1 fractions of width/height), so they are
+    resolution-independent; the pipeline scales them to pixels. Missing/invalid
+    parts return None so the corresponding rule is simply not registered.
     """
     if not isinstance(msg, dict):
         return None, None, None
-
     zone = msg.get("zone_polygon")
     if isinstance(zone, list) and len(zone) >= 3:
         zone = [(float(p[0]), float(p[1])) for p in zone]
@@ -152,163 +118,86 @@ def _parse_geometry(msg: dict):
     return zone, line_start, line_end
 
 
-_SENTINEL = object()
+@app.post("/feeds/{feed_id}/geometry")
+async def set_feed_geometry(feed_id: str, payload: dict) -> JSONResponse:
+    """Set/clear a running feed's detection zone/line (normalized coords).
+
+    Sent by the UI after the user draws on the live stream. Takes effect on the
+    next frame; annotated frames then show the zone/line.
+    """
+    mgr: FeedManager = app.state.feeds
+    feed = mgr.get(feed_id)
+    if feed is None:
+        return JSONResponse({"error": "unknown or finished feed"}, status_code=404)
+    zone, line_start, line_end = _parse_geometry(payload)
+    applied = feed.set_geometry(zone, line_start, line_end)
+    return JSONResponse({"applied": applied, "feed_id": feed_id})
 
 
-def _next(iterator):
-    """Blocking ``next`` wrapper for run_in_executor (returns sentinel at end)."""
+@app.post("/feeds/stream")
+async def add_stream(payload: dict) -> JSONResponse:
+    """Start a background feed from a live stream URL (RTSP / HLS / HTTP).
+
+    The feed runs on the server with no client attached; viewers watch via
+    ``WS /feeds/{id}/subscribe``. Nothing is stored except event snapshots +
+    ``events.csv``.
+    """
+    mgr: FeedManager = app.state.feeds
+    url = (payload.get("url") or "").strip() if isinstance(payload, dict) else ""
+    name = (payload.get("name") if isinstance(payload, dict) else None) or url
+    if not url:
+        return JSONResponse({"error": "missing 'url'"}, status_code=400)
+
+    loop = asyncio.get_event_loop()
+    cfg = Config()
+    cfg.write_output_video = False
+    cfg.inference_imgsz = 640  # live: subjects are closer, and this is faster
     try:
-        return next(iterator)
-    except StopIteration:
-        return _SENTINEL
+        source = await loop.run_in_executor(None, lambda: StreamURLSource(url).start())
+    except Exception as exc:  # noqa: BLE001 - bad URL / unreachable stream
+        return JSONResponse({"error": f"could not open stream: {exc}"}, status_code=400)
+
+    try:
+        feed = mgr.create(source, cfg, None, None, None, name=name, kind="stream", emit_image=True)
+    except RuntimeError as exc:  # feed limit reached
+        source.close()
+        return JSONResponse({"error": str(exc)}, status_code=429)
+
+    asyncio.create_task(feed.run())  # background; viewers attach via subscribe
+    return JSONResponse({
+        "feed_id": feed.feed_id, "name": name,
+        "width": source.width, "height": source.height, "fps": round(source.fps, 2),
+    })
 
 
-@app.websocket("/ws/{job_id}")
-async def scan_ws(websocket: WebSocket, job_id: str) -> None:
+@app.websocket("/feeds/{feed_id}/subscribe")
+async def subscribe_feed(websocket: WebSocket, feed_id: str) -> None:
+    """Attach a viewer to a running feed and relay its result payloads."""
     await websocket.accept()
-
-    video_path = _JOBS.get(job_id)
-    if video_path is None:
-        await websocket.send_json({"type": "error", "message": "Unknown job id."})
+    mgr: FeedManager = websocket.app.state.feeds
+    feed = mgr.get(feed_id)
+    if feed is None:
+        await websocket.send_json({"type": "error", "message": "unknown or finished feed"})
         await websocket.close()
         return
-
-    loop = asyncio.get_event_loop()
+    queue = feed.subscribe()
     try:
-        # First message carries optional zone/line geometry (may be empty {}).
-        cfg_msg = await websocket.receive_json()
-        zone, line_start, line_end = _parse_geometry(cfg_msg)
-
-        # Construct the scanner (loads model) off the event loop.
-        scanner: StreamingScanner = await loop.run_in_executor(
-            None,
-            lambda: StreamingScanner(
-                Config(), video_path,
-                zone_polygon=zone, line_start=line_start, line_end=line_end,
-            ),
-        )
-        await websocket.send_json(
-            {
-                "type": "meta",
-                "fps": round(scanner.fps, 2),
-                "total_frames": scanner.total_frames,
-                "width": scanner.width,
-                "height": scanner.height,
-            }
-        )
-
-        generator = scanner.scan()
+        await websocket.send_json({
+            "type": "meta", "feed_id": feed_id, "kind": feed.info.kind,
+            "fps": feed.info.fps, "total_frames": feed.info.total_frames,
+            "width": feed.info.width, "height": feed.info.height,
+        })
         while True:
-            update = await loop.run_in_executor(None, _next, generator)
-            if update is _SENTINEL:
+            payload = await queue.get()
+            await websocket.send_json(payload)
+            if payload.get("type") in ("done", "error"):
                 break
-
-            events = [
-                {**asdict(e)} for e in update.new_events
-            ]
-            await websocket.send_json(
-                {
-                    "type": "frame",
-                    "i": update.frame_index,
-                    "total": update.total_frames,
-                    "progress": round(
-                        100.0 * (update.frame_index + 1) / max(1, update.total_frames), 1
-                    ),
-                    "timestamp": format_timestamp(update.frame_index, update.fps),
-                    "image": _encode_frame(update.annotated),
-                    "events": events,
-                }
-            )
-
-        await websocket.send_json(
-            {"type": "done", "total_events": len(scanner.event_dicts), "events": scanner.event_dicts}
-        )
     except WebSocketDisconnect:
-        logger.info("Client disconnected from job %s; stopping scan.", job_id)
-    except Exception as exc:  # noqa: BLE001 - surface any error to the client
-        logger.exception("Scan failed for job %s", job_id)
-        try:
-            await websocket.send_json({"type": "error", "message": str(exc)})
-        except Exception:
-            pass
+        logger.info("Viewer left feed %s.", feed_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("subscribe relay failed for feed %s", feed_id)
     finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
-
-@app.websocket("/ws-live")
-async def live_ws(websocket: WebSocket) -> None:
-    """Live camera scanning: the browser pushes frames, we push back results.
-
-    Protocol (JSON messages):
-      client -> {"type":"init","fps":<n>}          once, first
-      server -> {"type":"ready"}
-      client -> {"type":"frame","image":"<dataURL>"}   (paced: one at a time)
-      server -> {"type":"result","i":n,"image":..,"events":[..]}
-      client -> {"type":"stop"}                     to end
-    """
-    await websocket.accept()
-    loop = asyncio.get_event_loop()
-    processor: FrameProcessor | None = None
-    frame_index = 0
-    try:
-        init = await websocket.receive_json()
-        fps = float(init.get("fps", 6.0)) if isinstance(init, dict) else 6.0
-        zone, line_start, line_end = _parse_geometry(init)
-        # Live webcam: the person is large/close, so a smaller inference size is
-        # plenty and much faster than the 1280 used for CCTV upload footage.
-        live_cfg = Config()
-        live_cfg.inference_imgsz = 640
-        processor = await loop.run_in_executor(
-            None,
-            lambda: FrameProcessor(
-                live_cfg, fps,
-                zone_polygon=zone, line_start=line_start, line_end=line_end,
-            ),
-        )
-        await websocket.send_json({"type": "ready"})
-
-        while True:
-            msg = await websocket.receive_json()
-            mtype = msg.get("type") if isinstance(msg, dict) else None
-            if mtype == "stop":
-                break
-            if mtype != "frame":
-                continue
-
-            frame = _decode_frame(msg["image"])
-            if frame is None:
-                continue
-
-            boxes, new_events, w, h = await loop.run_in_executor(
-                None, processor.process_json, frame, frame_index
-            )
-            # Return only lightweight JSON (boxes + events), no image. The browser
-            # draws these over its own local video, so the network carries ~1 KB.
-            await websocket.send_json(
-                {
-                    "type": "result",
-                    "i": frame_index,
-                    "w": w,
-                    "h": h,
-                    "boxes": boxes,
-                    "events": [asdict(e) for e in new_events],
-                }
-            )
-            frame_index += 1
-    except WebSocketDisconnect:
-        logger.info("Live client disconnected after %d frames.", frame_index)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Live scan failed")
-        try:
-            await websocket.send_json({"type": "error", "message": str(exc)})
-        except Exception:
-            pass
-    finally:
-        if processor is not None:
-            await loop.run_in_executor(None, processor.finalize)
+        feed.unsubscribe(queue)
         try:
             await websocket.close()
         except Exception:

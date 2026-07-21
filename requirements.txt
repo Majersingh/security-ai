@@ -1,7 +1,18 @@
-# Core AI / CV stack (pinned to major versions known to interoperate)
+# Dependencies for the CCTV operator-monitoring live-stream server.
+# Single file — the app is web-only (FastAPI + WebSocket); there is no CLI.
+
+# --- AI / CV stack ---
 ultralytics>=8.3.0        # YOLOv11 detection + built-in ByteTrack tracking
 lap>=0.5.12               # linear assignment, required by the built-in tracker
 supervision>=0.25,<0.30   # Detections container + annotators (ByteTrack removed in 0.30)
-opencv-python>=4.10.0     # video I/O and drawing
+opencv-python>=4.10.0     # drawing / image ops
+av>=12.0                  # PyAV: decode RTSP/HLS/HTTP streams (libav; no system ffmpeg)
 numpy>=1.26,<2.2          # array math (kept <2.2 for broad wheel compatibility)
 pandas>=2.2.0             # events CSV generation
+
+# --- Web server ---
+fastapi>=0.115.0          # routes + WebSocket transport
+uvicorn[standard]>=0.30.0 # ASGI server
+
+# --- Dev / testing (optional) ---
+imageio-ffmpeg>=0.5.0     # bundled ffmpeg for scripts/serve_test_stream.py
