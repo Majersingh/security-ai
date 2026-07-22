@@ -22,18 +22,11 @@ models/*.engine
 *.engine
 
 # ---- Input / uploaded media (large binaries) ----
-input/*.mp4
-input/*.dav
-input/*.avi
-input/*.mov
-input/*.mkv
+input
 uploads/
 
 # ---- Generated outputs ----
-output/annotated*.mp4
-output/*.csv
-output/snapshots/
-
+output
 # ---- Ultralytics / training artifacts ----
 runs/
 *.cache

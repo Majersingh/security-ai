@@ -234,15 +234,22 @@ discarded when the socket closes.
    NOTE: zone/line drawing is camera-only for now — upload feeds start with no
    geometry (phone-usage detection is unaffected). Per-tile upload geometry is a
    possible follow-up.
-4. ✅ **Live stream URL source** (`src/sources.py::StreamURLSource`). PyAV opens
-   RTSP/HLS/HTTP URLs in a background thread; **drop-to-latest** (keep newest
-   frame, skip stale) + **auto-reconnect with backoff**. Registered via
-   `POST /feeds/stream {url}` as a background feed (no client driving it); viewers
-   attach via `WS /feeds/{id}/subscribe`. Because streams have no local browser
-   copy, stream feeds emit **server-annotated JPEG frames**; `Feed` gained a
-   broadcast/subscribe model (`emit_image` flag; upload feeds stay boxes-only).
-   Dashboard has a stream-URL input; stream tiles render the annotated `<img>`.
-   Verified with a simulated stream (drop-to-latest confirmed; upload unaffected).
+4. ✅ **Stream URL source** (`src/sources.py::StreamURLSource`). PyAV opens
+   RTSP/HLS/HTTP URLs and decodes **sequentially, no drop, paced to the source
+   fps** — smooth playback with contiguous frame numbers (the RTX 4090 keeps up
+   at 640px). It auto-detects **live** (`rtsp://`/`rtmp://`/`.m3u8`/`.mpd` →
+   unbounded, `total_frames=0`, auto-reconnect on EOF) vs **finite file** (plain
+   `.mp4` etc. → plays once, real `total_frames`, correct progress/timeline).
+   Registered via `POST /feeds/stream {url}` as a background feed; viewers attach
+   via `WS /feeds/{id}/subscribe`. Because streams have no local browser copy,
+   stream feeds emit **server-annotated JPEG frames**; `Feed` has a
+   broadcast/subscribe model (`emit_image`). The dashboard renders each frame onto
+   a `<canvas>` (double-buffered, no flicker), with per-tile line/zone drawing.
+
+   (Earlier used background-thread drop-to-latest; switched to sequential+paced —
+   drop-to-latest fought HLS's segment bursts and made playback choppy. If a live
+   feed ever falls behind on a weaker GPU, latency grows rather than dropping —
+   acceptable on the 4090 target; revisit with a bounded queue if needed.)
 
 Live streams note: event timestamps/debounce use `seq/fps` (seq = decoded-frame
 count), which ≈ wall-clock when the GPU keeps up with the stream; on a box that

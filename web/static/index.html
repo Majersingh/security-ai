@@ -43,7 +43,7 @@
   .tile-status.done { background: rgba(63,185,80,.18); color: var(--green); }
   .tile-status.error, .tile-status.stopped { background: rgba(248,81,73,.18); color: var(--red); }
   .tile-stage { position: relative; background: #000; aspect-ratio: 16 / 9; }
-  .tile-stage img { width: 100%; height: 100%; object-fit: fill; display: block; }
+  .tile-stage .tile-view { width: 100%; height: 100%; display: block; }
   .tile-draw { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
   .tile-draw.active { pointer-events: auto; cursor: crosshair; }
   .tile-tools { display: flex; gap: 6px; align-items: center; padding: 7px 10px; border-top: 1px solid var(--border); flex-wrap: wrap; }
@@ -155,7 +155,7 @@ function buildTile(name) {
       <span class="tile-status">connecting</span>
       <button class="tile-stop danger small">Stop</button>
     </div>
-    <div class="tile-stage"><img /><canvas class="tile-draw"></canvas></div>
+    <div class="tile-stage"><canvas class="tile-view"></canvas><canvas class="tile-draw"></canvas></div>
     <div class="tile-tools">
       <button class="t-line ghost small" disabled>Line</button>
       <button class="t-zone ghost small" disabled>Zone</button>
@@ -169,7 +169,7 @@ function buildTile(name) {
 
   const tile = {
     localId, el, name, feedId: null, ws: null, finished: false, ready: false,
-    img: el.querySelector("img"),
+    view: el.querySelector(".tile-view"),
     draw: el.querySelector(".tile-draw"),
     statusEl: el.querySelector(".tile-status"),
     barEl: el.querySelector(".tile-bar-fill"),
@@ -182,6 +182,7 @@ function buildTile(name) {
     drawMode: null, tempPoints: [], _ev: 0,
   };
   tile.dctx = tile.draw.getContext("2d");
+  tile.vctx = tile.view.getContext("2d");
   el.querySelector(".tile-stop").onclick = () => stopFeed(tile);
   el.querySelector(".t-line").onclick = () => setTileTool(tile, tile.drawMode === "line" ? null : "line");
   el.querySelector(".t-zone").onclick = () => setTileTool(tile, tile.drawMode === "zone" ? null : "zone");
@@ -231,8 +232,13 @@ async function startStreamTile(url) {
     if (d.type === "meta") {
       onTileReady(tile, d.width, d.height);
     } else if (d.type === "frame") {
-      if (d.image) tile.img.src = "data:image/jpeg;base64," + d.image;
-      tile.progEl.textContent = "frame " + d.i;
+      if (d.image) drawTileFrame(tile, d.image);
+      if (d.total && d.total > 0) {                 // finite file: N / total + bar
+        tile.progEl.textContent = `frame ${d.i + 1} / ${d.total}`;
+        if (d.progress != null) tile.barEl.style.width = d.progress + "%";
+      } else {                                       // live stream: unbounded
+        tile.progEl.textContent = "frame " + d.i;
+      }
       tile.tsEl.textContent = d.timestamp || "—";
       (d.events || []).forEach((ev) => { addEventRow(tile.name, ev); bumpTileEvents(tile); });
     } else if (d.type === "done") {
@@ -250,11 +256,24 @@ function onTileReady(tile, w, h) {
   setTileStatus(tile, "scanning", "running");
   if (w && h) {
     tile.el.querySelector(".tile-stage").style.aspectRatio = `${w} / ${h}`;
-    tile.draw.width = w; tile.draw.height = h;
+    tile.view.width = w; tile.view.height = h;   // display canvas at native size
+    tile.draw.width = w; tile.draw.height = h;   // overlay matches (normalized coords)
   }
   tile.ready = true;
   ["t-line", "t-zone", "t-clear"].forEach((c) => tile.el.querySelector("." + c).disabled = false);
   tile.infoEl.textContent = "draw a line or zone";
+}
+
+// Draw an annotated frame onto the view canvas without flicker: decode the new
+// image first, then replace the canvas contents atomically (the previous frame
+// stays visible until the new one is ready — no blanking between frames).
+function drawTileFrame(tile, b64) {
+  const im = new Image();
+  im.onload = () => {
+    if (!tile.view.width || !tile.view.height) return;
+    tile.vctx.drawImage(im, 0, 0, tile.view.width, tile.view.height);
+  };
+  im.src = "data:image/jpeg;base64," + b64;
 }
 
 async function stopFeed(tile) {
