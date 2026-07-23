@@ -91,6 +91,7 @@ class Config:
 
     # --------------------------------------------------------------- runtime
     log_level: str = "INFO"
+    log_timing: bool = False   # per-frame TIMING lines (profiling; noisy — off by default)
 
     # ------------------------------------------------- multi-feed (concurrent)
     max_feeds: int = 80

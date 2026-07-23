@@ -39,6 +39,10 @@ from utils import resolve_device, setup_logging  # noqa: E402
 
 logger = setup_logging("INFO")
 
+# Ultralytics logs a per-inference "'half' is deprecated" warning that floods the
+# console at scale; we intentionally use half=True on CUDA, so quiet it.
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 

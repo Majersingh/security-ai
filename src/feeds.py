@@ -127,8 +127,13 @@ class Feed:
         return True
 
     def subscribe(self) -> asyncio.Queue:
-        """Register a viewer; returns a bounded queue of result payloads."""
-        q: asyncio.Queue = asyncio.Queue(maxsize=8)
+        """Register a viewer; returns a **latest-only** queue (maxsize=1).
+
+        A slow viewer (e.g. over a bandwidth-limited tunnel) must never make the
+        browser play an ever-growing backlog — it should always jump to the most
+        recent frame. `_emit` drops the stale frame when a newer one arrives.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
         self._subscribers.add(q)
         return q
 
@@ -227,12 +232,13 @@ class Feed:
                 now = time.monotonic()
                 gap_ms = (now - last_proc_t) * 1000.0
                 eff_fps = 1000.0 / gap_ms if gap_ms > 0 else 0.0
-                logger.info(
-                    "TIMING %s f=%d | %d pulled | decode=%.0fms pace=%.0fms "
-                    "infer=%.0fms emit=%.0fms | gap=%.0fms (%.1f proc-fps)",
-                    self.feed_id[:8], raw_idx, pulled, decode_accum, pace_accum,
-                    infer_ms, emit_ms, gap_ms, eff_fps,
-                )
+                if getattr(self._cfg, "log_timing", False):
+                    logger.info(
+                        "TIMING %s f=%d | %d pulled | decode=%.0fms pace=%.0fms "
+                        "infer=%.0fms emit=%.0fms | gap=%.0fms (%.1f proc-fps)",
+                        self.feed_id[:8], raw_idx, pulled, decode_accum, pace_accum,
+                        infer_ms, emit_ms, gap_ms, eff_fps,
+                    )
                 decode_accum = pace_accum = 0.0
                 pulled = 0
                 last_proc_t = now
