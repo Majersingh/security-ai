@@ -191,7 +191,7 @@ function buildTile(name) {
     <div class="tile-head">
       <span class="tile-name" title="${name}">${name}</span>
       <span class="tile-status">detecting</span>
-      <button class="tile-view ghost small">View</button>
+      <button class="tile-viewbtn ghost small">View</button>
       <button class="tile-stop danger small">Stop</button>
     </div>
     <div class="tile-stage"><canvas class="tile-view"></canvas><canvas class="tile-draw"></canvas></div>
@@ -212,7 +212,7 @@ function buildTile(name) {
     view: el.querySelector(".tile-view"),
     draw: el.querySelector(".tile-draw"),
     statusEl: el.querySelector(".tile-status"),
-    viewBtn: el.querySelector(".tile-view"),
+    viewBtn: el.querySelector(".tile-viewbtn"),
     barEl: el.querySelector(".tile-bar-fill"),
     progEl: el.querySelector(".prog"),
     evcEl: el.querySelector(".evc"),
