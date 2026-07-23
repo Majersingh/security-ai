@@ -41,10 +41,38 @@ class BatchInferencer:
         self._model = YOLO(str(config.model_path))
         self._queue: "asyncio.Queue[Tuple[np.ndarray, asyncio.Future]]" = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
+
+        # The set of batch sizes we'll ever run (powers of two up to max_batch).
+        # We pad every batch up to one of these so cuDNN only autotunes a few
+        # fixed sizes — otherwise a varying size (4,16,7,...) re-tunes each time,
+        # costing ~1s+ per batch and stalling every feed.
+        self._sizes = []
+        s = 1
+        while s < self._max_batch:
+            self._sizes.append(s)
+            s <<= 1
+        self._sizes.append(self._max_batch)
+
+        # Warm up each fixed size once now, so the first runtime batch of each
+        # size doesn't pay the autotune spike.
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        for n in self._sizes:
+            try:
+                self._model.predict(source=[dummy] * n, imgsz=config.inference_imgsz,
+                                     device=self._device, half=self._half, verbose=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Warmup at batch=%d failed: %s", n, exc)
         logger.info(
-            "BatchInferencer ready (device=%s, half=%s, imgsz=%d, max_batch=%d, wait=%.0fms).",
-            self._device, self._half, config.inference_imgsz, self._max_batch, self._max_wait * 1000,
+            "BatchInferencer ready (device=%s, half=%s, imgsz=%d, batch sizes=%s, wait=%.0fms).",
+            self._device, self._half, config.inference_imgsz, self._sizes, self._max_wait * 1000,
         )
+
+    def _pad_size(self, n: int) -> int:
+        """Round a batch count up to the nearest fixed (pre-warmed) size."""
+        for s in self._sizes:
+            if n <= s:
+                return s
+        return self._max_batch
 
     def start(self) -> "BatchInferencer":
         if self._task is None:
@@ -93,9 +121,12 @@ class BatchInferencer:
                         f.set_exception(exc)
 
     def _predict(self, frames: List[np.ndarray]) -> List[sv.Detections]:
-        """Run ONE batched forward pass over `frames`, return per-frame detections."""
+        """Run ONE batched forward pass, padded to a fixed size, return per-frame
+        detections (padding results are discarded)."""
+        n = len(frames)
+        padded = frames + [frames[-1]] * (self._pad_size(n) - n)  # pad to fixed size
         results = self._model.predict(
-            source=frames,
+            source=padded,
             conf=self._cfg.confidence_threshold,
             iou=self._cfg.iou_threshold,
             imgsz=self._cfg.inference_imgsz,
@@ -105,7 +136,7 @@ class BatchInferencer:
             verbose=False,
         )
         out: List[sv.Detections] = []
-        for r in results:
+        for r in results[:n]:                          # ignore padded frames
             det = sv.Detections.from_ultralytics(r)
             if det.class_id is not None and len(det):
                 det = det[np.isin(det.class_id, self._keep)]
