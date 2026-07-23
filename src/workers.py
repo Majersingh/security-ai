@@ -127,6 +127,7 @@ class _FeedRec:
     progress: float = 0.0
     event_count: int = 0
     error: str = ""
+    terminal: bool = False        # done/error/stopped — kept visible until cleared
     subscribers: Set[asyncio.Queue] = field(default_factory=set)
 
 
@@ -178,8 +179,12 @@ class WorkerPool:
 
     # ---- feed lifecycle ----
     def add_stream(self, url: str, name: str, zone, line_start, line_end) -> Optional[str]:
-        if len(self._feeds) >= self.max_feeds:
+        if self.count() >= self.max_feeds:      # active (non-terminal) feeds only
             return None
+        # Prune old terminal records so they don't accumulate across a session.
+        if len(self._feeds) > self.max_feeds * 2:
+            for fid in [f for f, r in self._feeds.items() if r.terminal][: len(self._feeds) - self.max_feeds]:
+                self._feeds.pop(fid, None)
         wid = min(range(self._n), key=lambda i: self._counts[i])   # least-loaded worker
         feed_id = uuid.uuid4().hex
         self._counts[wid] += 1
@@ -241,7 +246,7 @@ class WorkerPool:
         return _rec_info(rec) if rec else None
 
     def count(self) -> int:
-        return len(self._feeds)
+        return sum(1 for r in self._feeds.values() if not r.terminal)   # active only
 
     def list(self) -> List[dict]:
         return [_rec_info(r) for r in self._feeds.values()]
@@ -301,9 +306,11 @@ class WorkerPool:
                     except Exception:  # noqa: BLE001
                         pass
 
-        if ptype in ("done", "error"):
+        if ptype in ("done", "error") and not rec.terminal:
+            # Keep the record (visible in GET /feeds so the UI can show the
+            # done/error state); just free the worker slot for balancing.
+            rec.terminal = True
             self._counts[rec.worker_id] = max(0, self._counts[rec.worker_id] - 1)
-            self._feeds.pop(feed_id, None)
 
 
 def _rec_info(rec: _FeedRec) -> dict:

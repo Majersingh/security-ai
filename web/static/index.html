@@ -157,9 +157,29 @@ async function refreshSummary() {
     const s = await (await fetch("/feeds")).json();
     $("activeCount").textContent = s.active;
     $("maxCount").textContent = s.max_feeds;
+    // Reflect real server status onto each tile (so unviewed feeds show whether
+    // they're running/errored, not a permanent "detecting").
+    for (const info of (s.feeds || [])) {
+      const tile = byFeedId.get(info.feed_id);
+      if (!tile || tile.finished) continue;
+      if (info.status === "error") {
+        finishFeed(tile, "error", info.error ? ("error: " + info.error).slice(0, 60) : "stream error");
+      } else if (info.status === "done") {
+        finishFeed(tile, "done", "ended");
+      } else if (!tile.viewing) {
+        // running + not watched: prove the server is processing it
+        setTileStatus(tile, "detecting", "running");
+        tile.progEl.textContent = info.frame_index
+          ? `detecting · frame ${info.frame_index}` : "detecting…";
+        if (info.event_count) {
+          tile.evcEl.textContent = `${info.event_count} events`;
+          tile.evcEl.classList.add("hot");
+        }
+      }
+    }
   } catch (e) { /* ignore transient errors */ }
 }
-setInterval(refreshSummary, 4000);
+setInterval(refreshSummary, 2000);
 refreshSummary();
 
 /* ---------------- a stream feed tile ---------------- */
