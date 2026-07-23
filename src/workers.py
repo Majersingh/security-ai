@@ -102,6 +102,10 @@ async def _worker_loop(worker_id: int, cfg, ctrl_q: "mp.Queue", result_q: "mp.Qu
             f = feeds.get(msg["feed_id"])
             if f:
                 f.set_geometry(msg.get("zone"), msg.get("line_start"), msg.get("line_end"))
+        elif cmd == "view":
+            f = feeds.get(msg["feed_id"])
+            if f:
+                f.set_viewing(msg.get("on", False))
         elif cmd == "shutdown":
             break
 
@@ -139,6 +143,7 @@ class WorkerPool:
         self._procs: List["mp.Process"] = []
         self._counts: List[int] = [0] * self._n      # feeds per worker (for balancing)
         self._feeds: Dict[str, _FeedRec] = {}
+        self._event_subs: Set[asyncio.Queue] = set()   # global events (all feeds)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._drain_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -203,19 +208,33 @@ class WorkerPool:
         })
         return True
 
-    # ---- viewer subscription ----
+    # ---- viewer subscription (video) ----
     def subscribe(self, feed_id: str) -> Optional[asyncio.Queue]:
         rec = self._feeds.get(feed_id)
         if rec is None:
             return None
+        was_empty = not rec.subscribers
         q: asyncio.Queue = asyncio.Queue(maxsize=1)     # latest-only
         rec.subscribers.add(q)
+        if was_empty:                                   # first viewer -> start video
+            self._ctrl_qs[rec.worker_id].put({"cmd": "view", "feed_id": feed_id, "on": True})
         return q
 
     def unsubscribe(self, feed_id: str, q: asyncio.Queue) -> None:
         rec = self._feeds.get(feed_id)
         if rec is not None:
             rec.subscribers.discard(q)
+            if not rec.subscribers:                     # last viewer left -> stop video
+                self._ctrl_qs[rec.worker_id].put({"cmd": "view", "feed_id": feed_id, "on": False})
+
+    # ---- global events channel ----
+    def subscribe_events(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._event_subs.add(q)
+        return q
+
+    def unsubscribe_events(self, q: asyncio.Queue) -> None:
+        self._event_subs.discard(q)
 
     def get_info(self, feed_id: str) -> Optional[dict]:
         rec = self._feeds.get(feed_id)
@@ -259,15 +278,28 @@ class WorkerPool:
             rec.status = "error" if ptype == "error" else "done"
             rec.error = payload.get("message", "")
 
-        for q in list(rec.subscribers):
-            try:
-                q.put_nowait(payload)
-            except asyncio.QueueFull:
+        # Global events channel: forward any violations to all-feeds subscribers.
+        evs = payload.get("events")
+        if evs:
+            emsg = {"type": "events", "feed_id": feed_id, "name": rec.name, "events": evs}
+            for q in list(self._event_subs):
                 try:
-                    q.get_nowait()
-                    q.put_nowait(payload)
-                except Exception:  # noqa: BLE001
+                    q.put_nowait(emsg)
+                except asyncio.QueueFull:
                     pass
+
+        # Video viewers: image frames, plus terminal messages so their socket
+        # closes. (Event-only frames carry no image and aren't video-relevant.)
+        if payload.get("image") or ptype in ("done", "error"):
+            for q in list(rec.subscribers):
+                try:
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(payload)
+                    except Exception:  # noqa: BLE001
+                        pass
 
         if ptype in ("done", "error"):
             self._counts[rec.worker_id] = max(0, self._counts[rec.worker_id] - 1)

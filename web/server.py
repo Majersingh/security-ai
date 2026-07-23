@@ -270,5 +270,28 @@ async def subscribe_feed(websocket: WebSocket, feed_id: str) -> None:
             pass
 
 
+@app.websocket("/events")
+async def events_ws(websocket: WebSocket) -> None:
+    """Global events stream: violations from ALL feeds (viewed or not), so the
+    dashboard's alert panel never misses anything regardless of which videos are
+    being watched."""
+    await websocket.accept()
+    hub = websocket.app.state.pool or websocket.app.state.feeds
+    queue = hub.subscribe_events()
+    try:
+        while True:
+            await websocket.send_json(await queue.get())
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        logger.exception("events relay failed")
+    finally:
+        hub.unsubscribe_events(queue)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 # Serve the single-page UI at "/".
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

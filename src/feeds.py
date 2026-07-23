@@ -106,6 +106,9 @@ class Feed:
         # Cap how often we encode+send a frame to viewers (display rate), so the
         # browser stream stays light regardless of how fast detection runs.
         self._viewer_interval = 1.0 / max(1.0, float(getattr(cfg, "viewer_max_fps", 12.0)))
+        # Selective viewing: video is only encoded/sent when this feed is being
+        # watched. Detection + events still run regardless.
+        self._viewing = False
         self._proc: Optional[FrameProcessor] = None
         self._stop = asyncio.Event()
         self._on_update: Optional[UpdateFn] = None
@@ -119,6 +122,10 @@ class Feed:
     def stop(self) -> None:
         """Request the feed to stop after the current frame."""
         self._stop.set()
+
+    def set_viewing(self, on: bool) -> None:
+        """Enable/disable video encoding for this feed (detection is unaffected)."""
+        self._viewing = bool(on)
 
     def set_geometry(self, zone, line_start, line_end) -> bool:
         """Update the detection zone/line on this feed at runtime (normalized
@@ -208,10 +215,14 @@ class Feed:
                     continue
 
                 # Detection runs on EVERY processed frame (for events/accuracy),
-                # but we only encode+send an annotated frame to viewers at
-                # viewer_max_fps — the display stream is decoupled from detection.
+                # but we only encode+send an annotated frame when the feed is
+                # being VIEWED, and then at most viewer_max_fps.
+                viewing = self._viewing or bool(self._subscribers)
                 t_now = time.monotonic()
-                want_image = self._emit_image and (t_now - last_emit_t >= self._viewer_interval)
+                want_image = (
+                    self._emit_image and viewing
+                    and (t_now - last_emit_t >= self._viewer_interval)
+                )
 
                 t_inf = time.monotonic()
                 if self._manager.batched:
@@ -237,8 +248,14 @@ class Feed:
                 self.info.event_count = len(self._proc.event_log)
                 payload["progress"] = self.info.progress
 
-                # Send when: it's a display frame (has image), OR it carries events
-                # (so violations always reach the panel), OR it's a boxes-only feed.
+                # Events always reach the global events channel (all feeds, even
+                # unviewed ones) so the dashboard alerts never miss anything.
+                if events:
+                    self._manager.publish_events(self.feed_id, self.info.name, events)
+
+                # Emit when: a display frame (image), OR it carries events (so the
+                # coordinator/global channel sees them even for unviewed feeds),
+                # OR it's a boxes-only feed.
                 t_em = time.monotonic()
                 alive = True
                 if want_image or events or not self._emit_image:
@@ -298,6 +315,7 @@ class FeedManager:
             max_workers=max(depth, 8), thread_name_prefix="infer"
         )
         self._feeds: dict[str, Feed] = {}
+        self._event_subs: Set[asyncio.Queue] = set()   # global events (all feeds)
 
         # Batched inference: ONE shared model for all feeds (see batch.py).
         self.batched = bool(getattr(cfg, "batched_inference", False))
@@ -355,6 +373,26 @@ class FeedManager:
 
     def list(self) -> List[dict]:
         return [asdict(f.info) for f in self._feeds.values()]
+
+    # ---- global events channel (all feeds, independent of video viewing) ----
+    def subscribe_events(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._event_subs.add(q)
+        return q
+
+    def unsubscribe_events(self, q: asyncio.Queue) -> None:
+        self._event_subs.discard(q)
+
+    def publish_events(self, feed_id: str, name: str, events: list) -> None:
+        """Fan violation events to global-events viewers (dashboard alerts)."""
+        if not self._event_subs or not events:
+            return
+        msg = {"type": "events", "feed_id": feed_id, "name": name, "events": events}
+        for q in list(self._event_subs):
+            try:
+                q.put_nowait(msg)
+            except asyncio.QueueFull:
+                pass
 
     async def infer(
         self, proc: FrameProcessor, frame, frame_index: int, annotated: bool = False,

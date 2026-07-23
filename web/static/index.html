@@ -102,7 +102,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const feeds = new Map();     // localId -> tile
+const feeds = new Map();       // localId -> tile
+const byFeedId = new Map();    // feed_id -> tile
 let eventCount = 0;
 
 /* ---------------- shared events log ---------------- */
@@ -118,6 +119,23 @@ function addEventRow(feedName, ev) {
     `<td style="color:var(--red);font-weight:600">${ev.event}</td>`;
   $("log").prepend(tr);
 }
+
+/* -------- global events stream: violations from ALL feeds (viewed or not) ------- */
+function openEventsStream() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/events`);
+  ws.onmessage = (msg) => {
+    const d = JSON.parse(msg.data);
+    if (d.type !== "events") return;
+    const tile = byFeedId.get(d.feed_id);
+    (d.events || []).forEach((ev) => {
+      addEventRow(d.name, ev);
+      if (tile) bumpTileEvents(tile);
+    });
+  };
+  ws.onclose = () => setTimeout(openEventsStream, 2000);   // auto-reconnect
+}
+openEventsStream();
 
 /* ---------------- add / clear streams ---------------- */
 $("addStream").onclick = () => {
@@ -152,7 +170,8 @@ function buildTile(name) {
   el.innerHTML = `
     <div class="tile-head">
       <span class="tile-name" title="${name}">${name}</span>
-      <span class="tile-status">connecting</span>
+      <span class="tile-status">detecting</span>
+      <button class="tile-view ghost small">View</button>
       <button class="tile-stop danger small">Stop</button>
     </div>
     <div class="tile-stage"><canvas class="tile-view"></canvas><canvas class="tile-draw"></canvas></div>
@@ -169,9 +188,11 @@ function buildTile(name) {
 
   const tile = {
     localId, el, name, feedId: null, ws: null, finished: false, ready: false,
+    viewing: false,
     view: el.querySelector(".tile-view"),
     draw: el.querySelector(".tile-draw"),
     statusEl: el.querySelector(".tile-status"),
+    viewBtn: el.querySelector(".tile-view"),
     barEl: el.querySelector(".tile-bar-fill"),
     progEl: el.querySelector(".prog"),
     evcEl: el.querySelector(".evc"),
@@ -183,6 +204,7 @@ function buildTile(name) {
   };
   tile.dctx = tile.draw.getContext("2d");
   tile.vctx = tile.view.getContext("2d");
+  tile.viewBtn.onclick = () => toggleView(tile);
   el.querySelector(".tile-stop").onclick = () => stopFeed(tile);
   el.querySelector(".t-line").onclick = () => setTileTool(tile, tile.drawMode === "line" ? null : "line");
   el.querySelector(".t-zone").onclick = () => setTileTool(tile, tile.drawMode === "zone" ? null : "zone");
@@ -206,8 +228,8 @@ function bumpTileEvents(tile) {
 
 async function startStreamTile(url) {
   const tile = buildTile(url);
-  setTileStatus(tile, "connecting", "running");
-  $("statusMsg").textContent = "Connecting to " + url + " …";
+  setTileStatus(tile, "starting", "running");
+  $("statusMsg").textContent = "Starting " + url + " …";
   let res;
   try {
     res = await (await fetch("/feeds/stream", {
@@ -221,9 +243,26 @@ async function startStreamTile(url) {
     return;
   }
   tile.feedId = res.feed_id;
-  $("statusMsg").textContent = `Streaming ${url} (${res.width}×${res.height} @ ${res.fps} fps).`;
+  byFeedId.set(tile.feedId, tile);
+  // Detection runs server-side immediately; video is only pulled when you View.
+  setTileStatus(tile, "detecting", "running");
+  tile.progEl.textContent = "detecting (not viewed)";
+  $("statusMsg").textContent = `${feeds.size} feed(s) — detection running on all; click View to watch one.`;
   refreshSummary();
+}
 
+// Toggle whether this feed's VIDEO is streamed to the browser. Detection keeps
+// running on the server regardless — this only controls bandwidth for viewing.
+function toggleView(tile) {
+  if (tile.finished || !tile.feedId) return;
+  if (tile.viewing) { disconnectView(tile); } else { connectView(tile); }
+}
+
+function connectView(tile) {
+  tile.viewing = true;
+  tile.viewBtn.textContent = "Unview";
+  tile.viewBtn.classList.add("on");
+  setTileStatus(tile, "viewing", "running");
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/feeds/${tile.feedId}/subscribe`);
   tile.ws = ws;
@@ -232,23 +271,35 @@ async function startStreamTile(url) {
     if (d.type === "meta") {
       onTileReady(tile, d.width, d.height);
     } else if (d.type === "frame") {
-      if (d.image) drawTileFrame(tile, d.image);
-      if (d.total && d.total > 0) {                 // finite file: N / total + bar
+      if (!tile.ready && d.w && d.h) onTileReady(tile, d.w, d.h);  // size from frame if meta had no dims
+      if (d.image) drawTileFrame(tile, d.image);   // events come via /events, not here
+      if (d.total && d.total > 0) {
         tile.progEl.textContent = `frame ${d.i + 1} / ${d.total}`;
         if (d.progress != null) tile.barEl.style.width = d.progress + "%";
-      } else {                                       // live stream: unbounded
+      } else {
         tile.progEl.textContent = "frame " + d.i;
       }
       tile.tsEl.textContent = d.timestamp || "—";
-      (d.events || []).forEach((ev) => { addEventRow(tile.name, ev); bumpTileEvents(tile); });
     } else if (d.type === "done") {
       finishFeed(tile, "done", "ended");
     } else if (d.type === "error") {
       finishFeed(tile, "error", d.message || "error");
     }
   };
-  ws.onerror = () => finishFeed(tile, "error", "connection error");
-  ws.onclose = () => { if (!tile.finished) finishFeed(tile, "stopped", "disconnected"); };
+  ws.onerror = () => { if (tile.viewing) setTileStatus(tile, "view error", "error"); };
+  ws.onclose = () => { tile.ws = null; };
+}
+
+function disconnectView(tile) {
+  tile.viewing = false;
+  tile.viewBtn.textContent = "View";
+  tile.viewBtn.classList.remove("on");
+  setTileStatus(tile, "detecting", "running");
+  tile.progEl.textContent = "detecting (not viewed)";
+  try { if (tile.ws && tile.ws.readyState === WebSocket.OPEN) tile.ws.close(); } catch (e) {}
+  tile.ws = null;
+  // clear the video canvas
+  if (tile.view.width) tile.vctx.clearRect(0, 0, tile.view.width, tile.view.height);
 }
 
 function onTileReady(tile, w, h) {
@@ -286,10 +337,13 @@ async function stopFeed(tile) {
 function finishFeed(tile, status, text) {
   if (tile.finished) return;
   tile.finished = true;
+  tile.viewing = false;
   setTileStatus(tile, text || status, status);
   tile.el.querySelector(".tile-stop").disabled = true;
+  tile.viewBtn.disabled = true;
   ["t-line", "t-zone", "t-finish", "t-clear"].forEach((c) => tile.el.querySelector("." + c).disabled = true);
   tile.draw.classList.remove("active");
+  if (tile.feedId) byFeedId.delete(tile.feedId);
   $("clearDone").disabled = false;
   refreshSummary();
 }
