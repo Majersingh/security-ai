@@ -75,7 +75,14 @@ class BatchInferencer:
             frames = [b[0] for b in batch]
             futs = [b[1] for b in batch]
             try:
+                t0 = loop.time()
                 dets = await loop.run_in_executor(None, self._predict, frames)
+                if getattr(self._cfg, "log_timing", False):
+                    dt = (loop.time() - t0) * 1000.0
+                    logger.info(
+                        "BATCH n=%d predict=%.0fms (%.0fms/frame)",
+                        len(frames), dt, dt / max(1, len(frames)),
+                    )
                 for f, d in zip(futs, dets):
                     if not f.done():
                         f.set_result(d)
