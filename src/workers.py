@@ -21,7 +21,7 @@ import queue as pyqueue
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger("operator_monitor")
@@ -275,6 +275,12 @@ class WorkerPool:
 
 
 def _rec_info(rec: _FeedRec) -> dict:
-    d = asdict(rec)
-    d.pop("subscribers", None)
-    return d
+    # Build manually — asdict() would deep-copy `subscribers` (asyncio.Queue
+    # objects hold a _contextvars.Context that can't be copied).
+    return {
+        "feed_id": rec.feed_id, "name": rec.name, "kind": rec.kind,
+        "status": rec.status, "fps": rec.fps, "width": rec.width,
+        "height": rec.height, "total_frames": rec.total_frames,
+        "frame_index": rec.frame_index, "progress": rec.progress,
+        "event_count": rec.event_count, "worker_id": rec.worker_id, "error": rec.error,
+    }

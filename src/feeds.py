@@ -103,6 +103,9 @@ class Feed:
         # server-annotated JPEG frames; upload feeds send boxes-only JSON and the
         # browser draws them over its own local <video>.
         self._emit_image = emit_image
+        # Cap how often we encode+send a frame to viewers (display rate), so the
+        # browser stream stays light regardless of how fast detection runs.
+        self._viewer_interval = 1.0 / max(1.0, float(getattr(cfg, "viewer_max_fps", 12.0)))
         self._proc: Optional[FrameProcessor] = None
         self._stop = asyncio.Event()
         self._on_update: Optional[UpdateFn] = None
@@ -192,6 +195,7 @@ class Feed:
             pace_accum = 0.0            # pacing-sleep ms since last processed frame
             pulled = 0                  # frames pulled (incl. skipped) since last processed
             last_proc_t = time.monotonic()
+            last_emit_t = 0.0           # last time we sent an annotated frame to viewers
             while not self._stop.is_set():
                 item = await loop.run_in_executor(None, _next, gen)
                 decode_accum += getattr(self._source, "last_decode_ms", 0.0)
@@ -202,17 +206,24 @@ class Feed:
                 raw_idx, frame = item
                 if raw_idx % self._stride:      # honour stride (raw index kept)
                     continue
-                # GPU step: batched (shared model) or gated single-image.
+
+                # Detection runs on EVERY processed frame (for events/accuracy),
+                # but we only encode+send an annotated frame to viewers at
+                # viewer_max_fps — the display stream is decoupled from detection.
+                t_now = time.monotonic()
+                want_image = self._emit_image and (t_now - last_emit_t >= self._viewer_interval)
+
                 t_inf = time.monotonic()
                 if self._manager.batched:
                     payload = await self._manager.infer_batched(
-                        self._proc, frame, raw_idx, annotated=self._emit_image
+                        self._proc, frame, raw_idx, annotated=want_image
                     )
                 else:
                     payload = await self._manager.infer(
-                        self._proc, frame, raw_idx, annotated=self._emit_image
+                        self._proc, frame, raw_idx, annotated=want_image
                     )
                 infer_ms = (time.monotonic() - t_inf) * 1000.0
+                events = payload.get("events") or []
                 payload.update({
                     "type": "frame", "feed_id": self.feed_id, "i": raw_idx,
                     "total": self.info.total_frames,
@@ -225,8 +236,15 @@ class Feed:
                 )
                 self.info.event_count = len(self._proc.event_log)
                 payload["progress"] = self.info.progress
+
+                # Send when: it's a display frame (has image), OR it carries events
+                # (so violations always reach the panel), OR it's a boxes-only feed.
                 t_em = time.monotonic()
-                alive = await self._emit(payload)
+                alive = True
+                if want_image or events or not self._emit_image:
+                    alive = await self._emit(payload)
+                    if want_image:
+                        last_emit_t = t_now
                 emit_ms = (time.monotonic() - t_em) * 1000.0
 
                 now = time.monotonic()
@@ -372,9 +390,11 @@ class FeedManager:
     def _infer_annotated(proc: FrameProcessor, frame, frame_index: int, detections=None) -> dict:
         annotated, events = proc.process(frame, frame_index, detections)
         h, w = annotated.shape[:2]
-        if w > _STREAM_MAX_WIDTH:  # shrink the wire payload; detection was full-res
-            scale = _STREAM_MAX_WIDTH / w
-            annotated = cv2.resize(annotated, (_STREAM_MAX_WIDTH, int(h * scale)))
-        ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+        cfg = proc._config
+        max_w = int(getattr(cfg, "viewer_max_width", _STREAM_MAX_WIDTH))
+        quality = int(getattr(cfg, "viewer_jpeg_quality", _JPEG_QUALITY))
+        if w > max_w:  # shrink the wire payload; detection ran at full res
+            annotated = cv2.resize(annotated, (max_w, int(h * (max_w / w))))
+        ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, quality])
         image = base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
         return {"w": w, "h": h, "image": image, "events": [asdict(e) for e in events]}

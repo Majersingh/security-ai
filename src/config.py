@@ -117,6 +117,15 @@ class Config:
     batch_max_size: int = 16        # max frames combined into one GPU call
     batch_max_wait_ms: int = 12     # how long to wait to fill a batch
 
+    # ---- Viewer stream (browser delivery) ----
+    # Annotated frames sent to browsers are throttled + shrunk INDEPENDENTLY of
+    # detection, so remote viewing (especially over a tunnel) stays smooth even
+    # though the server processes far faster. Detection still runs on every
+    # processed frame; frames that carry events are always forwarded.
+    viewer_max_fps: float = 12.0
+    viewer_max_width: int = 640
+    viewer_jpeg_quality: int = 45
+
     # ---- Multiprocess workers (escape the single-process GIL) ----
     # 0 = run everything in the web process (fine for a few feeds). >0 = spawn N
     # worker processes; the web process becomes a thin coordinator that assigns
