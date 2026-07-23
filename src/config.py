@@ -48,7 +48,7 @@ class Config:
     # Process only every Nth frame (1 = every frame). E.g. on a 30 fps video,
     # frame_stride=30 analyses ~1 frame/second: much faster, coarser timing.
     # Time-based thresholds auto-adjust to the effective rate (fps / stride).
-    frame_stride: int = 1
+    frame_stride: int = 10
 
     # ---------------------------------------------------------------- tracker
     # Ultralytics built-in tracker config: "bytetrack.yaml" or "botsort.yaml".
@@ -93,10 +93,10 @@ class Config:
     # One YOLO model is loaded PER feed because the tracker state lives on the
     # model object (see detector.track persist=True), so feeds cannot share one.
     # VRAM therefore caps how many feeds run at once.
-    max_feeds: int = 8
+    max_feeds: int = 80
     # Inference across all feeds is serialized by a shared GPU gate this many
     # deep, so N concurrent feeds don't thrash the single GPU.
-    max_concurrent_inferences: int = 2
+    max_concurrent_inferences: int = 80
 
     # Human-readable event label, kept here so wording is not scattered around.
     event_labels: dict = field(

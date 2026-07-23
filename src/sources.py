@@ -52,6 +52,10 @@ class StreamURLSource:
         self.width = 0
         self.height = 0
         self.total_frames = 0  # 0 = unknown/unbounded (live)
+        # Timing hooks (ms), updated per frame — for profiling. last_decode_ms is
+        # real decode/network time; last_wait_ms is the pacing sleep (expected).
+        self.last_decode_ms = 0.0
+        self.last_wait_ms = 0.0
 
     @classmethod
     def _detect_live(cls, url: str) -> bool:
@@ -101,14 +105,20 @@ class StreamURLSource:
         next_t = time.monotonic()
         while not self._stop:
             try:
-                for frame in self._container.decode(self._stream):
-                    if self._stop:
-                        return
+                decoder = self._container.decode(self._stream)
+                while not self._stop:
+                    t_dec = time.monotonic()           # time the real decode/network read
+                    try:
+                        frame = next(decoder)
+                    except StopIteration:
+                        break
+                    self.last_decode_ms = (time.monotonic() - t_dec) * 1000.0
                     img = frame.to_ndarray(format="bgr24")
                     if self.width == 0 or self.height == 0:
                         self.height, self.width = img.shape[:2]
                     if interval:                       # pace to source fps
                         delay = next_t - time.monotonic()
+                        self.last_wait_ms = max(0.0, delay) * 1000.0
                         if delay > 0:
                             time.sleep(delay)
                         next_t += interval

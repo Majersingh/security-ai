@@ -182,17 +182,26 @@ class Feed:
             })
 
             gen = self._source.frames()
+            decode_accum = 0.0          # real decode/network ms since last processed frame
+            pace_accum = 0.0            # pacing-sleep ms since last processed frame
+            pulled = 0                  # frames pulled (incl. skipped) since last processed
+            last_proc_t = time.monotonic()
             while not self._stop.is_set():
                 item = await loop.run_in_executor(None, _next, gen)
+                decode_accum += getattr(self._source, "last_decode_ms", 0.0)
+                pace_accum += getattr(self._source, "last_wait_ms", 0.0)
+                pulled += 1
                 if item is _SENTINEL:
                     break
                 raw_idx, frame = item
                 if raw_idx % self._stride:      # honour stride (raw index kept)
                     continue
                 # The ONLY gated step: shared across all feeds on the one GPU.
+                t_inf = time.monotonic()
                 payload = await self._manager.infer(
                     self._proc, frame, raw_idx, annotated=self._emit_image
                 )
+                infer_ms = (time.monotonic() - t_inf) * 1000.0
                 payload.update({
                     "type": "frame", "feed_id": self.feed_id, "i": raw_idx,
                     "total": self.info.total_frames,
@@ -205,7 +214,23 @@ class Feed:
                 )
                 self.info.event_count = len(self._proc.event_log)
                 payload["progress"] = self.info.progress
+                t_em = time.monotonic()
                 alive = await self._emit(payload)
+                emit_ms = (time.monotonic() - t_em) * 1000.0
+
+                now = time.monotonic()
+                gap_ms = (now - last_proc_t) * 1000.0
+                eff_fps = 1000.0 / gap_ms if gap_ms > 0 else 0.0
+                logger.info(
+                    "TIMING %s f=%d | %d pulled | decode=%.0fms pace=%.0fms "
+                    "infer=%.0fms emit=%.0fms | gap=%.0fms (%.1f proc-fps)",
+                    self.feed_id[:8], raw_idx, pulled, decode_accum, pace_accum,
+                    infer_ms, emit_ms, gap_ms, eff_fps,
+                )
+                decode_accum = pace_accum = 0.0
+                pulled = 0
+                last_proc_t = now
+
                 if not alive:                    # driver (upload client) gone
                     self._stop.set()
                     break
