@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from contextlib import asynccontextmanager  # noqa: E402
@@ -293,5 +293,12 @@ async def events_ws(websocket: WebSocket) -> None:
             pass
 
 
-# Serve the single-page UI at "/".
+@app.get("/")
+async def index() -> FileResponse:
+    """Serve the dashboard with no-store so browsers never run a stale copy
+    (we iterate on the UI a lot; caching kept biting)."""
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+
+
+# Serve remaining static assets at "/".
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
