@@ -33,6 +33,18 @@
   .summary { margin-left: auto; font-size: 13px; color: var(--muted); }
   .summary b { color: var(--text); }
 
+  /* viewing dropdown */
+  #viewMenu { position: absolute; z-index: 20; top: 116%; left: 0; min-width: 280px;
+    max-height: 360px; overflow: auto; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  .vm-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+  .vm-item:hover { background: #1c2333; }
+  .vm-item input { margin: 0; }
+  .vm-item .vm-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .vm-item .vm-status { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .vm-item .vm-status.error { color: var(--red); }
+  .vm-item .vm-status.running { color: var(--green); }
+
   #feedGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
   #feedEmpty { color: var(--muted); font-size: 14px; padding: 40px 0; text-align: center; }
   .tile { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: #0b0f14; }
@@ -75,8 +87,15 @@
   <div class="controls panel">
     <input type="text" id="streamUrl" placeholder="rtsp://user:pass@host/stream   or   https://…/index.m3u8" />
     <button id="addStream">Add Stream</button>
+    <div style="position:relative">
+      <button id="viewMenuBtn" class="ghost">👁 Viewing (<span id="viewCount">0</span>) ▾</button>
+      <div id="viewMenu" class="hidden">
+        <div id="viewMenuEmpty" style="color:var(--muted);font-size:12px;padding:6px 4px;">No feeds yet.</div>
+        <div id="viewMenuList"></div>
+      </div>
+    </div>
     <button id="clearDone" class="ghost small" disabled>Clear finished</button>
-    <span class="summary">Feeds: <b id="activeCount">0</b> / <span id="maxCount">–</span></span>
+    <span class="summary">Detecting: <b id="activeCount">0</b> / <span id="maxCount">–</span></span>
   </div>
   <div id="statusMsg" style="color:var(--muted);font-size:12px;margin:6px 2px 18px;">Paste a stream URL and click “Add Stream”.</div>
 
@@ -137,45 +156,47 @@ function openEventsStream() {
 }
 openEventsStream();
 
-/* ---------------- add / clear streams ---------------- */
+/* ---------------- add / clear / viewing dropdown ---------------- */
 $("addStream").onclick = () => {
   const url = $("streamUrl").value.trim();
   if (!url) return;
-  startStreamTile(url);
+  addFeed(url);
   $("streamUrl").value = "";
 };
 $("streamUrl").addEventListener("keydown", (e) => { if (e.key === "Enter") $("addStream").click(); });
+$("viewMenuBtn").onclick = (e) => { e.stopPropagation(); $("viewMenu").classList.toggle("hidden"); };
+document.addEventListener("click", (e) => {
+  if (!$("viewMenu").contains(e.target) && e.target !== $("viewMenuBtn")) $("viewMenu").classList.add("hidden");
+});
 $("clearDone").onclick = () => {
-  for (const [id, t] of feeds) if (t.finished) { t.el.remove(); feeds.delete(id); }
-  refreshEmpty(); refreshSummary();
+  for (const [, t] of Array.from(feeds)) if (t.finished) removeFeed(t);
+  refreshMenuEmpty(); refreshEmpty(); refreshSummary();
 };
 
-function refreshEmpty() { $("feedEmpty").classList.toggle("hidden", feeds.size > 0); }
+function refreshEmpty() { $("feedEmpty").classList.toggle("hidden", $("feedGrid").children.length > 0); }
+function refreshMenuEmpty() { $("viewMenuEmpty").classList.toggle("hidden", feeds.size > 0); }
+function updateViewCount() {
+  let n = 0; for (const t of feeds.values()) if (t.viewing) n++;
+  $("viewCount").textContent = n;
+}
 
 async function refreshSummary() {
   try {
     const s = await (await fetch("/feeds")).json();
     $("activeCount").textContent = s.active;
     $("maxCount").textContent = s.max_feeds;
-    // Reflect real server status onto each tile (so unviewed feeds show whether
-    // they're running/errored, not a permanent "detecting").
     for (const info of (s.feeds || [])) {
       const tile = byFeedId.get(info.feed_id);
       if (!tile || tile.finished) continue;
       if (info.status === "error") {
-        finishFeed(tile, "error", info.error ? ("error: " + info.error).slice(0, 60) : "stream error");
-      } else if (info.status === "done") {
-        finishFeed(tile, "done", "ended");
-      } else if (!tile.viewing) {
-        // running + not watched: prove the server is processing it
-        setTileStatus(tile, "detecting", "running");
-        tile.progEl.textContent = info.frame_index
-          ? `detecting · frame ${info.frame_index}` : "detecting…";
-        if (info.event_count) {
-          tile.evcEl.textContent = `${info.event_count} events`;
-          tile.evcEl.classList.add("hot");
-        }
+        finishFeed(tile, "error", (info.error ? "error: " + info.error : "stream error").slice(0, 60)); continue;
       }
+      if (info.status === "done") { finishFeed(tile, "done", "ended"); continue; }
+      // running: reflect in the dropdown item (+ the tile if it's being viewed)
+      const st = info.frame_index ? `detecting · f${info.frame_index}` : "detecting…";
+      setMenuStatus(tile, st, "running");
+      if (info.event_count) setMenuEvents(tile, info.event_count);
+      if (!tile.viewing) { tile.progEl.textContent = st; setTileStatus(tile, "detecting", "running"); }
     }
   } catch (e) { /* ignore transient errors */ }
 }
@@ -190,8 +211,7 @@ function buildTile(name) {
   el.innerHTML = `
     <div class="tile-head">
       <span class="tile-name" title="${name}">${name}</span>
-      <span class="tile-status">detecting</span>
-      <button class="tile-viewbtn ghost small">View</button>
+      <span class="tile-status">viewing</span>
       <button class="tile-stop danger small">Stop</button>
     </div>
     <div class="tile-stage"><canvas class="tile-view"></canvas><canvas class="tile-draw"></canvas></div>
@@ -200,19 +220,17 @@ function buildTile(name) {
       <button class="t-zone ghost small" disabled>Zone</button>
       <button class="t-finish ghost small" style="display:none">Finish</button>
       <button class="t-clear ghost small" disabled>Clear</button>
-      <span class="t-info">connect to draw rules</span>
+      <span class="t-info">draw a line or zone</span>
     </div>
     <div class="tile-bar"><div class="tile-bar-fill"></div></div>
     <div class="tile-meta"><span class="prog">—</span><span class="evc">0 events</span><span class="ts">—</span></div>`;
-  $("feedGrid").appendChild(el);
-
+  // NOTE: not appended to the grid here — added only when selected in the dropdown.
   const tile = {
     localId, el, name, feedId: null, ws: null, finished: false, ready: false,
-    viewing: false,
+    viewing: false, menuItem: null,
     view: el.querySelector(".tile-view"),
     draw: el.querySelector(".tile-draw"),
     statusEl: el.querySelector(".tile-status"),
-    viewBtn: el.querySelector(".tile-viewbtn"),
     barEl: el.querySelector(".tile-bar-fill"),
     progEl: el.querySelector(".prog"),
     evcEl: el.querySelector(".evc"),
@@ -224,15 +242,12 @@ function buildTile(name) {
   };
   tile.dctx = tile.draw.getContext("2d");
   tile.vctx = tile.view.getContext("2d");
-  tile.viewBtn.onclick = () => toggleView(tile);
   el.querySelector(".tile-stop").onclick = () => stopFeed(tile);
   el.querySelector(".t-line").onclick = () => setTileTool(tile, tile.drawMode === "line" ? null : "line");
   el.querySelector(".t-zone").onclick = () => setTileTool(tile, tile.drawMode === "zone" ? null : "zone");
   el.querySelector(".t-finish").onclick = () => finishZone(tile);
   el.querySelector(".t-clear").onclick = () => clearGeometry(tile);
   tile.draw.addEventListener("click", (e) => onDrawClick(tile, e));
-  feeds.set(localId, tile);
-  refreshEmpty();
   return tile;
 }
 
@@ -246,9 +261,7 @@ function bumpTileEvents(tile) {
   tile.evcEl.classList.add("hot");
 }
 
-async function startStreamTile(url) {
-  const tile = buildTile(url);
-  setTileStatus(tile, "starting", "running");
+async function addFeed(url) {
   $("statusMsg").textContent = "Starting " + url + " …";
   let res;
   try {
@@ -256,32 +269,54 @@ async function startStreamTile(url) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, name: url }),
     })).json();
-  } catch (e) { finishFeed(tile, "error", "request failed"); return; }
+  } catch (e) { $("statusMsg").textContent = "Request failed"; return; }
   if (!res || res.error) {
-    finishFeed(tile, "error", (res && res.error) || "failed");
     $("statusMsg").textContent = "Could not start: " + ((res && res.error) || "failed");
     return;
   }
+  const tile = buildTile(url);
   tile.feedId = res.feed_id;
+  feeds.set(tile.localId, tile);
   byFeedId.set(tile.feedId, tile);
-  // Detection runs server-side immediately; video is only pulled when you View.
-  setTileStatus(tile, "detecting", "running");
-  tile.progEl.textContent = "detecting (not viewed)";
-  $("statusMsg").textContent = `${feeds.size} feed(s) — detection running on all; click View to watch one.`;
+  addMenuItem(tile);
+  refreshMenuEmpty();
+  $("statusMsg").textContent = `${feeds.size} feed(s) detecting. Open “👁 Viewing ▾” to pick which to watch.`;
   refreshSummary();
 }
 
-// Toggle whether this feed's VIDEO is streamed to the browser. Detection keeps
-// running on the server regardless — this only controls bandwidth for viewing.
-function toggleView(tile) {
-  if (tile.finished || !tile.feedId) return;
-  if (tile.viewing) { disconnectView(tile); } else { connectView(tile); }
+/* ---- viewing dropdown items ---- */
+function addMenuItem(tile) {
+  const item = document.createElement("label");
+  item.className = "vm-item";
+  item.innerHTML =
+    `<input type="checkbox"><span class="vm-name" title="${tile.name}">${tile.name}</span>` +
+    `<span class="vm-status">starting…</span>`;
+  const cb = item.querySelector("input");
+  cb.onchange = () => setView(tile, cb.checked);
+  $("viewMenuList").appendChild(item);
+  tile.menuItem = { el: item, cb, statusEl: item.querySelector(".vm-status") };
+}
+function setMenuStatus(tile, text, cls) {
+  if (!tile.menuItem) return;
+  tile.menuItem.statusEl.textContent = text;
+  tile.menuItem.statusEl.className = "vm-status" + (cls ? " " + cls : "");
+}
+function setMenuEvents(tile, n) {
+  tile._ev = n;
+  tile.evcEl.textContent = `${n} events`;
+  tile.evcEl.classList.add("hot");
+}
+
+// Show/hide a feed's tile + video. Detection keeps running server-side either way.
+function setView(tile, on) {
+  if (tile.finished) return;
+  if (on && !tile.viewing) { $("feedGrid").appendChild(tile.el); connectView(tile); }
+  else if (!on && tile.viewing) { disconnectView(tile); tile.el.remove(); }
+  updateViewCount(); refreshEmpty();
 }
 
 function connectView(tile) {
   tile.viewing = true;
-  tile.viewBtn.textContent = "Unview";
-  tile.viewBtn.classList.add("on");
   setTileStatus(tile, "viewing", "running");
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/feeds/${tile.feedId}/subscribe`);
@@ -312,14 +347,17 @@ function connectView(tile) {
 
 function disconnectView(tile) {
   tile.viewing = false;
-  tile.viewBtn.textContent = "View";
-  tile.viewBtn.classList.remove("on");
-  setTileStatus(tile, "detecting", "running");
-  tile.progEl.textContent = "detecting (not viewed)";
   try { if (tile.ws && tile.ws.readyState === WebSocket.OPEN) tile.ws.close(); } catch (e) {}
   tile.ws = null;
-  // clear the video canvas
   if (tile.view.width) tile.vctx.clearRect(0, 0, tile.view.width, tile.view.height);
+}
+
+function removeFeed(tile) {
+  if (tile.viewing) disconnectView(tile);
+  tile.el.remove();
+  if (tile.menuItem) tile.menuItem.el.remove();
+  if (tile.feedId) byFeedId.delete(tile.feedId);
+  feeds.delete(tile.localId);
 }
 
 function onTileReady(tile, w, h) {
@@ -348,24 +386,25 @@ function drawTileFrame(tile, b64) {
 }
 
 async function stopFeed(tile) {
-  if (tile.finished) return;
   if (tile.feedId) { try { await fetch(`/feeds/${tile.feedId}/stop`, { method: "POST" }); } catch (e) {} }
-  try { if (tile.ws && tile.ws.readyState === WebSocket.OPEN) tile.ws.close(); } catch (e) {}
   finishFeed(tile, "stopped", "stopped");
 }
 
 function finishFeed(tile, status, text) {
   if (tile.finished) return;
   tile.finished = true;
+  if (tile.viewing) { disconnectView(tile); tile.el.remove(); }   // pull the tile off the grid
   tile.viewing = false;
   setTileStatus(tile, text || status, status);
-  tile.el.querySelector(".tile-stop").disabled = true;
-  tile.viewBtn.disabled = true;
-  ["t-line", "t-zone", "t-finish", "t-clear"].forEach((c) => tile.el.querySelector("." + c).disabled = true);
-  tile.draw.classList.remove("active");
-  if (tile.feedId) byFeedId.delete(tile.feedId);
+  // Reflect terminal state in the dropdown item and lock its checkbox.
+  if (tile.menuItem) {
+    tile.menuItem.cb.checked = false;
+    tile.menuItem.cb.disabled = true;
+    setMenuStatus(tile, text || status, status);
+  }
+  updateViewCount();
+  refreshEmpty();
   $("clearDone").disabled = false;
-  refreshSummary();
 }
 
 /* ---------------- per-tile line / zone drawing ---------------- */
