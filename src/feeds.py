@@ -172,6 +172,7 @@ class Feed:
                     self._cfg, self._source.fps,
                     processing_fps=self._source.fps / self._stride,
                     zone_polygon=zone, line_start=line_start, line_end=line_end,
+                    batched=self._manager.batched,
                 ),
             )
             self.info.status = "running"
@@ -196,11 +197,16 @@ class Feed:
                 raw_idx, frame = item
                 if raw_idx % self._stride:      # honour stride (raw index kept)
                     continue
-                # The ONLY gated step: shared across all feeds on the one GPU.
+                # GPU step: batched (shared model) or gated single-image.
                 t_inf = time.monotonic()
-                payload = await self._manager.infer(
-                    self._proc, frame, raw_idx, annotated=self._emit_image
-                )
+                if self._manager.batched:
+                    payload = await self._manager.infer_batched(
+                        self._proc, frame, raw_idx, annotated=self._emit_image
+                    )
+                else:
+                    payload = await self._manager.infer(
+                        self._proc, frame, raw_idx, annotated=self._emit_image
+                    )
                 infer_ms = (time.monotonic() - t_inf) * 1000.0
                 payload.update({
                     "type": "frame", "feed_id": self.feed_id, "i": raw_idx,
@@ -262,11 +268,25 @@ class FeedManager:
         self.max_feeds = int(getattr(cfg, "max_feeds", 8))
         depth = max(1, int(getattr(cfg, "max_concurrent_inferences", 2)))
         self._gate = asyncio.Semaphore(depth)
-        # Dedicated pool sized to the gate depth so gated tasks always get a
-        # thread without competing with decode work on the default executor.
-        self._infer_pool = ThreadPoolExecutor(max_workers=depth, thread_name_prefix="infer")
+        # A small pool for the post-detection work (track/rules/annotate/encode).
+        # Sized a bit above the gate depth so batched feeds aren't thread-starved.
+        self._infer_pool = ThreadPoolExecutor(
+            max_workers=max(depth, 8), thread_name_prefix="infer"
+        )
         self._feeds: dict[str, Feed] = {}
-        logger.info("FeedManager ready: max_feeds=%d, gpu_gate_depth=%d.", self.max_feeds, depth)
+
+        # Batched inference: ONE shared model for all feeds (see batch.py).
+        self.batched = bool(getattr(cfg, "batched_inference", False))
+        self._batcher = None
+        if self.batched:
+            from batch import BatchInferencer  # local import: optional dependency path
+            self._batcher = BatchInferencer(cfg).start()
+        logger.info(
+            "FeedManager ready: max_feeds=%d, mode=%s%s.",
+            self.max_feeds,
+            "batched" if self.batched else "per-feed-model",
+            "" if self.batched else f", gpu_gate_depth={depth}",
+        )
 
     def create(
         self, source: FrameSource, cfg: Config, zone, line_start, line_end,
@@ -322,14 +342,24 @@ class FeedManager:
         async with self._gate:
             return await loop.run_in_executor(self._infer_pool, fn, proc, frame, frame_index)
 
+    async def infer_batched(
+        self, proc: FrameProcessor, frame, frame_index: int, annotated: bool = False,
+    ) -> dict:
+        """Batched path: the shared model detects (combined with other feeds in
+        one GPU call); the per-feed track/rules/annotate runs in a worker thread."""
+        detections = await self._batcher.infer(frame)     # awaits the batch (GPU)
+        loop = asyncio.get_event_loop()
+        fn = self._infer_annotated if annotated else self._infer_boxes
+        return await loop.run_in_executor(self._infer_pool, fn, proc, frame, frame_index, detections)
+
     @staticmethod
-    def _infer_boxes(proc: FrameProcessor, frame, frame_index: int) -> dict:
-        boxes, events, w, h = proc.process_json(frame, frame_index)
+    def _infer_boxes(proc: FrameProcessor, frame, frame_index: int, detections=None) -> dict:
+        boxes, events, w, h = proc.process_json(frame, frame_index, detections)
         return {"w": w, "h": h, "boxes": boxes, "events": [asdict(e) for e in events]}
 
     @staticmethod
-    def _infer_annotated(proc: FrameProcessor, frame, frame_index: int) -> dict:
-        annotated, events = proc.process(frame, frame_index)
+    def _infer_annotated(proc: FrameProcessor, frame, frame_index: int, detections=None) -> dict:
+        annotated, events = proc.process(frame, frame_index, detections)
         h, w = annotated.shape[:2]
         if w > _STREAM_MAX_WIDTH:  # shrink the wire payload; detection was full-res
             scale = _STREAM_MAX_WIDTH / w

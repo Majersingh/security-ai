@@ -41,9 +41,12 @@ class Config:
     iou_threshold: float = 0.5           # NMS IoU for the detector
     # "auto" picks GPU (cuda/mps) if available, else cpu. Or force: "cpu","0","mps".
     device: str = "auto"
-    # High-res CCTV footage: a phone is tiny relative to the frame, so 640
-    # downscaling loses it. 1280 detects it reliably (see README notes).
-    inference_imgsz: int = 1280          # model input resolution
+    # Model input resolution — the single knob trading accuracy vs throughput
+    # (also caps how many feeds fit on one GPU, since cost scales ~quadratically):
+    #   640  -> ~4x faster, many more feeds, but MISSES tiny/distant phones
+    #   1280 -> reliably detects small phones in high-res CCTV, but ~4x heavier
+    # In batched mode this applies to the one shared model (all feeds use it).
+    inference_imgsz: int = 1280           # raise to 1280 if phones are small/far
 
     # Process only every Nth frame (1 = every frame). E.g. on a 30 fps video,
     # frame_stride=30 analyses ~1 frame/second: much faster, coarser timing.
@@ -90,13 +93,27 @@ class Config:
     log_level: str = "INFO"
 
     # ------------------------------------------------- multi-feed (concurrent)
-    # One YOLO model is loaded PER feed because the tracker state lives on the
-    # model object (see detector.track persist=True), so feeds cannot share one.
-    # VRAM therefore caps how many feeds run at once.
     max_feeds: int = 80
-    # Inference across all feeds is serialized by a shared GPU gate this many
-    # deep, so N concurrent feeds don't thrash the single GPU.
-    max_concurrent_inferences: int = 80
+    # Non-batched path only: inference is serialized by a shared GPU gate this
+    # many deep. Keep this SMALL (2-4) — a high value makes many feeds thrash the
+    # GPU + GIL and *lowers* throughput. Ignored when batched_inference is on.
+    max_concurrent_inferences: int = 4
+
+    # Drop-when-behind: if a feed can't keep up with real time, skip stale frames
+    # so latency stays bounded instead of growing forever (matters under load /
+    # for live cameras). A feed more than this many seconds behind schedule drops
+    # frames to catch up.
+    drop_when_behind: bool = True
+    stream_max_lag_seconds: float = 0.5
+
+    # ---- Batched inference (throughput unlock for many feeds on one GPU) ----
+    # When on, ALL feeds share ONE model and their frames are combined into a
+    # single batched predict() call (far more GPU-efficient than one-at-a-time).
+    # Tracking then runs per-feed via supervision.ByteTrack (the model is used
+    # statelessly). When off, each feed gets its own model + the GPU gate above.
+    batched_inference: bool = True
+    batch_max_size: int = 16        # max frames combined into one GPU call
+    batch_max_wait_ms: int = 12     # how long to wait to fill a batch
 
     # Human-readable event label, kept here so wording is not scattered around.
     event_labels: dict = field(

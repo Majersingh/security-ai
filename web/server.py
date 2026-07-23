@@ -69,8 +69,9 @@ def _log_hardware() -> None:
 async def lifespan(app: "FastAPI"):
     logger.info("Server starting up…")
     _log_hardware()
-    # One manager for the whole process: registry + shared GPU gate. Built here
-    # so the semaphore binds to the running event loop.
+    # One manager for the whole process: registry + shared batched model (or GPU
+    # gate). Built here so the async bits bind to the running event loop.
+    # Detection resolution etc. come from Config (see inference_imgsz there).
     app.state.feeds = FeedManager(Config())
     yield
     logger.info("Server shutting down.")
@@ -151,9 +152,11 @@ async def add_stream(payload: dict) -> JSONResponse:
     loop = asyncio.get_event_loop()
     cfg = Config()
     cfg.write_output_video = False
-    cfg.inference_imgsz = 640  # live: subjects are closer, and this is faster
+    max_lag = cfg.stream_max_lag_seconds if cfg.drop_when_behind else 0.0
     try:
-        source = await loop.run_in_executor(None, lambda: StreamURLSource(url).start())
+        source = await loop.run_in_executor(
+            None, lambda: StreamURLSource(url, max_lag_s=max_lag).start()
+        )
     except Exception as exc:  # noqa: BLE001 - bad URL / unreachable stream
         return JSONResponse({"error": f"could not open stream: {exc}"}, status_code=400)
 

@@ -37,13 +37,16 @@ class StreamURLSource:
 
     def __init__(
         self, url: str, *, live: Optional[bool] = None, target_fps: Optional[float] = None,
-        reconnect_backoff: float = 3.0, open_timeout: float = 15.0,
+        reconnect_backoff: float = 3.0, open_timeout: float = 15.0, max_lag_s: float = 0.0,
     ) -> None:
         self._url = url
         self.is_live = self._detect_live(url) if live is None else live
         self._target_fps = target_fps
         self._backoff = max(0.5, reconnect_backoff)
         self._open_timeout = open_timeout
+        # >0 enables drop-when-behind: a frame more than this many seconds behind
+        # schedule is dropped (not yielded) so latency stays bounded under load.
+        self._max_lag_s = max_lag_s
         self._stop = False
         self._container = None
         self._stream = None
@@ -116,14 +119,23 @@ class StreamURLSource:
                     img = frame.to_ndarray(format="bgr24")
                     if self.width == 0 or self.height == 0:
                         self.height, self.width = img.shape[:2]
+                    drop = False
                     if interval:                       # pace to source fps
-                        delay = next_t - time.monotonic()
+                        now = time.monotonic()
+                        delay = next_t - now
                         self.last_wait_ms = max(0.0, delay) * 1000.0
+                        next_t += interval
                         if delay > 0:
                             time.sleep(delay)
-                        next_t += interval
-                        if next_t < time.monotonic():  # fell behind -> don't bank debt
-                            next_t = time.monotonic()
+                        elif self._max_lag_s and (-delay) > self._max_lag_s:
+                            # too far behind real time -> drop this frame to catch up
+                            next_t = now
+                            drop = True
+                        elif next_t < now:             # mildly behind -> don't bank debt
+                            next_t = now
+                    if drop:
+                        idx += 1
+                        continue                       # frame dropped (not processed)
                     yield idx, img
                     idx += 1
             except Exception as exc:  # noqa: BLE001 - decode/network hiccup

@@ -15,6 +15,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+import supervision as sv
+
 from annotator import Annotator
 from behavior import BehaviorEngine, build_rules
 from config import Config
@@ -39,13 +41,25 @@ class FrameProcessor:
         zone_polygon: Optional[List[Point]] = None,
         line_start: Optional[Point] = None,
         line_end: Optional[Point] = None,
+        batched: bool = False,
     ) -> None:
         # zone/line coordinates are *normalized* (0..1 fractions of width/height)
         # so they are independent of the frame resolution. They are scaled to
         # pixels lazily on the first frame, once the real frame size is known.
         self._config = config
         config.ensure_output_dirs()
-        self._detector = Detector(config)
+        # Batched mode: a shared model does detection elsewhere and hands us the
+        # detections; this feed owns only its identity tracker (supervision
+        # ByteTrack). Non-batched: this feed owns a full Detector (model + tracker).
+        self._batched = batched
+        if batched:
+            self._detector = None
+            self._bytetrack = sv.ByteTrack(
+                frame_rate=max(1, int(round(processing_fps or fps or 30)))
+            )
+        else:
+            self._detector = Detector(config)
+            self._bytetrack = None
         self._tracker = Tracker(config)
         self._event_log = EventLog(config)
         self._snapshots = SnapshotManager(config)
@@ -89,8 +103,12 @@ class FrameProcessor:
             processing_fps=self._processing_fps,
         )
 
-    def _run(self, frame: np.ndarray, frame_index: int):
-        """Shared core: detect -> track -> rules. Returns raw results."""
+    def _run(self, frame: np.ndarray, frame_index: int, detections=None):
+        """Shared core: detect -> track -> rules. Returns raw results.
+
+        In batched mode ``detections`` are supplied by the shared model; otherwise
+        this processor's own detector produces them.
+        """
         pending = self._pending_geom
         if pending is not None:                       # geometry changed at runtime
             self._pending_geom = None
@@ -100,28 +118,31 @@ class FrameProcessor:
             h, w = frame.shape[:2]
             self._build_engine(w, h)
         before = len(self._event_log)
-        detections = self._detector.track(frame)
-        persons, phones = self._tracker.route(detections)
+        if self._batched:
+            # Detection came from the shared batched model; track identities here.
+            tracked = self._bytetrack.update_with_detections(detections)
+            persons, phones = self._tracker.route(tracked)
+        else:
+            det = self._detector.track(frame)   # own model: fused detect + track
+            persons, phones = self._tracker.route(det)
         result = self._engine.process(persons, phones, frame_index, frame)
         new_events = self._event_log.events[before:]
         return persons, phones, result, new_events
 
-    def process(self, frame: np.ndarray, frame_index: int) -> Tuple[np.ndarray, List[Event]]:
-        """Run the pipeline and return an ANNOTATED frame (used for upload mode)."""
-        persons, phones, result, new_events = self._run(frame, frame_index)
+    def process(self, frame: np.ndarray, frame_index: int, detections=None) -> Tuple[np.ndarray, List[Event]]:
+        """Run the pipeline and return an ANNOTATED frame (used for stream feeds)."""
+        persons, phones, result, new_events = self._run(frame, frame_index, detections)
         annotated = self._annotator.annotate(frame, persons, phones, result)
         self._engine.draw_overlays(annotated)  # zone/line overlays
         return annotated, new_events
 
-    def process_json(self, frame: np.ndarray, frame_index: int):
+    def process_json(self, frame: np.ndarray, frame_index: int, detections=None):
         """Run the pipeline and return DETECTIONS as plain data (no image).
 
-        Used by live camera mode: the browser draws these boxes over its own
-        local video, so only a tiny JSON payload crosses the network.
         Returns (boxes, new_events, width, height).
         """
         h, w = frame.shape[:2]
-        persons, phones, result, new_events = self._run(frame, frame_index)
+        persons, phones, result, new_events = self._run(frame, frame_index, detections)
         boxes: List[dict] = []
         for i in range(len(persons)):
             tid = int(persons.tracker_id[i]) if persons.tracker_id is not None else -1
