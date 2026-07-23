@@ -297,11 +297,16 @@ class FeedManager:
     def create(
         self, source: FrameSource, cfg: Config, zone, line_start, line_end,
         name: str, kind: str = "upload", emit_image: bool = False,
+        feed_id: Optional[str] = None,
     ) -> Feed:
-        """Register a new feed. Raises RuntimeError if the feed limit is hit."""
+        """Register a new feed. Raises RuntimeError if the feed limit is hit.
+
+        ``feed_id`` lets a coordinator assign the id (used by the worker pool);
+        otherwise one is generated.
+        """
         if len(self._feeds) >= self.max_feeds:
             raise RuntimeError(f"feed limit reached ({self.max_feeds} concurrent)")
-        feed_id = uuid.uuid4().hex
+        feed_id = feed_id or uuid.uuid4().hex
         # Per-feed artefact dirs so concurrent feeds never clobber events.csv /
         # each other's snapshots. Base dir = wherever config points (output/).
         base = cfg.events_csv.parent / feed_id

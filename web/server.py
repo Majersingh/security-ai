@@ -73,11 +73,21 @@ def _log_hardware() -> None:
 async def lifespan(app: "FastAPI"):
     logger.info("Server starting up…")
     _log_hardware()
-    # One manager for the whole process: registry + shared batched model (or GPU
-    # gate). Built here so the async bits bind to the running event loop.
-    # Detection resolution etc. come from Config (see inference_imgsz there).
-    app.state.feeds = FeedManager(Config())
+    cfg = Config()
+    # num_workers>0: coordinator mode (worker processes escape the GIL for true
+    # parallelism). 0: everything in this process (fine for a few feeds).
+    if getattr(cfg, "num_workers", 0) and cfg.num_workers > 0:
+        from workers import WorkerPool
+        app.state.pool = WorkerPool(cfg).start()
+        app.state.feeds = None
+        logger.info("Coordinator mode: %d worker process(es).", cfg.num_workers)
+    else:
+        app.state.pool = None
+        app.state.feeds = FeedManager(cfg)
+        logger.info("In-process mode (num_workers=0).")
     yield
+    if getattr(app.state, "pool", None) is not None:
+        app.state.pool.shutdown()
     logger.info("Server shutting down.")
 
 
@@ -87,15 +97,17 @@ app = FastAPI(title="CCTV Operator Monitoring - Live Streams", lifespan=lifespan
 @app.get("/feeds")
 async def list_feeds() -> dict:
     """Snapshot of all active feeds (for the dashboard)."""
-    mgr: FeedManager = app.state.feeds
+    mgr = app.state.pool or app.state.feeds
     return {"feeds": mgr.list(), "active": mgr.count(), "max_feeds": mgr.max_feeds}
 
 
 @app.post("/feeds/{feed_id}/stop")
 async def stop_feed(feed_id: str) -> dict:
     """Ask a running feed to stop."""
-    mgr: FeedManager = app.state.feeds
-    return {"stopped": mgr.stop(feed_id), "feed_id": feed_id}
+    pool = app.state.pool
+    if pool is not None:
+        return {"stopped": pool.stop(feed_id), "feed_id": feed_id}
+    return {"stopped": app.state.feeds.stop(feed_id), "feed_id": feed_id}
 
 
 def _parse_geometry(msg: dict):
@@ -130,11 +142,14 @@ async def set_feed_geometry(feed_id: str, payload: dict) -> JSONResponse:
     Sent by the UI after the user draws on the live stream. Takes effect on the
     next frame; annotated frames then show the zone/line.
     """
-    mgr: FeedManager = app.state.feeds
-    feed = mgr.get(feed_id)
+    zone, line_start, line_end = _parse_geometry(payload)
+    pool = app.state.pool
+    if pool is not None:
+        applied = pool.set_geometry(feed_id, zone, line_start, line_end)
+        return JSONResponse({"applied": applied, "feed_id": feed_id})
+    feed = app.state.feeds.get(feed_id)
     if feed is None:
         return JSONResponse({"error": "unknown or finished feed"}, status_code=404)
-    zone, line_start, line_end = _parse_geometry(payload)
     applied = feed.set_geometry(zone, line_start, line_end)
     return JSONResponse({"applied": applied, "feed_id": feed_id})
 
@@ -143,16 +158,28 @@ async def set_feed_geometry(feed_id: str, payload: dict) -> JSONResponse:
 async def add_stream(payload: dict) -> JSONResponse:
     """Start a background feed from a live stream URL (RTSP / HLS / HTTP).
 
-    The feed runs on the server with no client attached; viewers watch via
-    ``WS /feeds/{id}/subscribe``. Nothing is stored except event snapshots +
+    In coordinator mode the feed is assigned to a worker process; viewers watch
+    via ``WS /feeds/{id}/subscribe``. Nothing is stored except event snapshots +
     ``events.csv``.
     """
-    mgr: FeedManager = app.state.feeds
     url = (payload.get("url") or "").strip() if isinstance(payload, dict) else ""
     name = (payload.get("name") if isinstance(payload, dict) else None) or url
     if not url:
         return JSONResponse({"error": "missing 'url'"}, status_code=400)
+    zone, line_start, line_end = _parse_geometry(payload)
 
+    pool = app.state.pool
+    if pool is not None:
+        # Optimistic: the worker opens the stream; failures surface on the
+        # subscribe socket as an "error" payload.
+        feed_id = pool.add_stream(url, name, zone, line_start, line_end)
+        if feed_id is None:
+            return JSONResponse({"error": f"feed limit reached ({pool.max_feeds})"},
+                                status_code=429)
+        return JSONResponse({"feed_id": feed_id, "name": name})
+
+    # ---- in-process mode ----
+    mgr: FeedManager = app.state.feeds
     loop = asyncio.get_event_loop()
     cfg = Config()
     cfg.write_output_video = False
@@ -163,14 +190,13 @@ async def add_stream(payload: dict) -> JSONResponse:
         )
     except Exception as exc:  # noqa: BLE001 - bad URL / unreachable stream
         return JSONResponse({"error": f"could not open stream: {exc}"}, status_code=400)
-
     try:
-        feed = mgr.create(source, cfg, None, None, None, name=name, kind="stream", emit_image=True)
+        feed = mgr.create(source, cfg, zone, line_start, line_end,
+                          name=name, kind="stream", emit_image=True)
     except RuntimeError as exc:  # feed limit reached
         source.close()
         return JSONResponse({"error": str(exc)}, status_code=429)
-
-    asyncio.create_task(feed.run())  # background; viewers attach via subscribe
+    asyncio.create_task(feed.run())
     return JSONResponse({
         "feed_id": feed.feed_id, "name": name,
         "width": source.width, "height": source.height, "fps": round(source.fps, 2),
@@ -181,6 +207,39 @@ async def add_stream(payload: dict) -> JSONResponse:
 async def subscribe_feed(websocket: WebSocket, feed_id: str) -> None:
     """Attach a viewer to a running feed and relay its result payloads."""
     await websocket.accept()
+    pool = websocket.app.state.pool
+
+    if pool is not None:
+        info = pool.get_info(feed_id)
+        if info is None:
+            await websocket.send_json({"type": "error", "message": "unknown or finished feed"})
+            await websocket.close()
+            return
+        queue = pool.subscribe(feed_id)
+        try:
+            await websocket.send_json({
+                "type": "meta", "feed_id": feed_id, "kind": info.get("kind", "stream"),
+                "fps": info.get("fps", 0.0), "total_frames": info.get("total_frames", 0),
+                "width": info.get("width", 0), "height": info.get("height", 0),
+            })
+            while True:
+                payload = await queue.get()
+                await websocket.send_json(payload)
+                if payload.get("type") in ("done", "error"):
+                    break
+        except WebSocketDisconnect:
+            logger.info("Viewer left feed %s.", feed_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("subscribe relay failed for feed %s", feed_id)
+        finally:
+            pool.unsubscribe(feed_id, queue)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+        return
+
+    # ---- in-process mode ----
     mgr: FeedManager = websocket.app.state.feeds
     feed = mgr.get(feed_id)
     if feed is None:

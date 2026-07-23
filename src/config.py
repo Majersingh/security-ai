@@ -11,6 +11,7 @@ whether the source is 15, 25 or 30 fps.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -115,6 +116,15 @@ class Config:
     batched_inference: bool = True
     batch_max_size: int = 16        # max frames combined into one GPU call
     batch_max_wait_ms: int = 12     # how long to wait to fill a batch
+
+    # ---- Multiprocess workers (escape the single-process GIL) ----
+    # 0 = run everything in the web process (fine for a few feeds). >0 = spawn N
+    # worker processes; the web process becomes a thin coordinator that assigns
+    # feeds to workers and relays their frames/events. Each worker runs the full
+    # pipeline for its feeds in parallel (own GIL) and shares the GPU. Default
+    # auto-sizes to the CPU cores (capped), since the bottleneck is CPU-bound
+    # per-feed work (decode/track/annotate/encode).
+    num_workers: int = field(default_factory=lambda: min(os.cpu_count() or 4, 8))
 
     # Human-readable event label, kept here so wording is not scattered around.
     event_labels: dict = field(
