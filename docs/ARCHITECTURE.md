@@ -236,6 +236,8 @@ hw_decode: bool = True           # NVDEC; falls back to software automatically
 num_workers: int = physical_cores()   # capped at 8; 0 = everything in-process
 cv_threads: int = 1              # per-process intra-op caps, so N procs don't
 torch_threads: int = 1           #   each size their pools from the whole box
+infer_threads: int = 0           # the INFERENCE process, deliberately NOT 1
+                                 #   0 = auto: cores the workers aren't using
 
 # inference service
 batch_max_size: int = 16         # frames combined into one GPU call
@@ -345,6 +347,26 @@ discarded when the socket closes.
    two feeds at ~real time with distinct workers and no error payloads.
    **Not yet verified on GPU:** NVDEC actually engaging, and FP16 batch throughput.
 
+7. ✅ **Two throughput fixes found by running phase 6 under real load on the GPU
+   host** (many 720p feeds, `TIMING … infer≈205ms … 4.6 proc-fps`):
+   - **The inference process must not be thread-capped.** Phase 6 applied
+     `cv_threads/torch_threads = 1` to *every* process including the inference one,
+     but Ultralytics preprocesses each frame on the CPU inside that process
+     (letterbox to `inference_imgsz`, BGR→RGB, HWC→CHW, stack). With one thread
+     that work serializes against the GPU, so the GPU idles waiting for it — low
+     utilisation on *both* devices while feeds queue. Now sized by `infer_threads`.
+   - **`drop_when_behind` never fired.** The pacer reset `next_t = now` on every
+     frame, capping measured lag at one frame interval — so with a 40ms interval and
+     a 0.5s tolerance the drop condition was unreachable and a feed that couldn't
+     keep up played in **slow motion** instead of skipping to stay live. The
+     schedule is now authoritative. Measured with a 200ms/frame consumer on a 25 fps
+     source: 2.3s of video per 12s wall-clock before (5x slow motion), 11.4s per 12s
+     after (real time, 233 stale frames skipped).
+
+   Diagnostic note: per-feed `infer=` in the TIMING line is **queue wait +
+   preprocess + GPU**, not GPU time. Read the `BATCH n=… predict=…ms` line to tell
+   a saturated GPU (`n` at `batch_max_size`) from a starved queue (small `n`).
+
 Live streams note: event timestamps/debounce use `seq/fps` (seq = decoded-frame
 count), which ≈ wall-clock when the GPU keeps up with the stream; on a box that
 can't, sustained-violation thresholds trigger slightly late. Fine for the target
@@ -370,6 +392,13 @@ nothing to recover but live-stream reconnection, which lives in Phase 4.)
 - **The inference process is a single point of failure.** If it dies, every feed
   stalls — its batches fail and each feed sees an exception per frame. There is no
   supervisor restarting it yet.
+- **The inference process is one Python thread doing preprocess → GPU → respond in
+  sequence, with no pipelining.** While the GPU computes batch K nothing is
+  preparing batch K+1, so the GPU can never be fully fed no matter how many threads
+  `infer_threads` grants. Fixing this properly means double-buffering (prepare the
+  next batch while the current one is on the GPU), or exporting to TensorRT/ONNX
+  where preprocessing can move onto the GPU. This is the next real throughput
+  ceiling, and the reason GPU utilisation stays below 100% under load.
 - **`num_workers > 1` only pays off if post-processing is the bottleneck.** With
   detection centralized, more workers add decode/annotate parallelism but also
   more IPC. Measure before raising it.

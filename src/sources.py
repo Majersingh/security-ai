@@ -176,10 +176,20 @@ class StreamURLSource:
                         if delay > 0:
                             time.sleep(delay)
                         elif self._max_lag_s and (-delay) > self._max_lag_s:
-                            # too far behind real time -> drop this frame to catch up
-                            next_t = now
+                            # More than max_lag behind schedule: skip this frame and
+                            # do NOT resync — skipping is cheap, so the backlog
+                            # shrinks frame by frame until we are live again.
+                            #
+                            # Resetting next_t here (as this used to) capped the
+                            # measured lag at one frame interval, so with a 40ms
+                            # interval and a 0.5s tolerance the condition could
+                            # never be true: dropping never happened, and a feed
+                            # that couldn't keep up played in slow motion instead
+                            # of staying near-live.
                             drop = True
-                        elif next_t < now:             # mildly behind -> don't bank debt
+                        elif not self._max_lag_s and next_t < now:
+                            # Dropping disabled: never bank debt, or a slow consumer
+                            # would make the source sprint to catch up later.
                             next_t = now
                     if drop:
                         idx += 1

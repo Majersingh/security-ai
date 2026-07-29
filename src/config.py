@@ -53,7 +53,7 @@ class Config:
     # Process only every Nth frame (1 = every frame). E.g. on a 30 fps video,
     # frame_stride=30 analyses ~1 frame/second: much faster, coarser timing.
     # Time-based thresholds auto-adjust to the effective rate (fps / stride).
-    frame_stride: int = 1
+    frame_stride: int = 10
 
     # ---------------------------------------------------------------- tracker
     # Identity tracking is per-feed (supervision.ByteTrack in FrameProcessor),
@@ -154,6 +154,15 @@ class Config:
     # machine, which oversubscribes the CPU N-fold and thrashes the scheduler.
     cv_threads: int = 1
     torch_threads: int = 1
+
+    # The INFERENCE process is the exception — do NOT cap it to 1. Ultralytics
+    # preprocesses every frame on the CPU *inside* that process (letterbox to
+    # inference_imgsz, BGR->RGB, HWC->CHW, stack), for every frame of every batch.
+    # At imgsz 1280 that is tens of ms per batch of 16, and it runs serialized
+    # against the GPU: starve this process of threads and the GPU sits idle waiting
+    # for preprocessing, showing low utilisation while feeds queue up behind it.
+    # 0 = auto: the physical cores the workers aren't using (minimum 2).
+    infer_threads: int = 0
 
     # Human-readable event label, kept here so wording is not scattered around.
     event_labels: dict = field(

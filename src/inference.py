@@ -40,7 +40,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import supervision as sv
 
-from utils import limit_process_threads, resolve_device, setup_logging
+from utils import (
+    limit_process_threads, physical_cores, resolve_device, setup_logging,
+)
 
 logger = logging.getLogger("operator_monitor")
 
@@ -244,7 +246,13 @@ class FrameRing:
 
 def _inference_process(cfg, spec: RingSpec, req_q, resp_qs: List[Any]) -> None:
     """Entry point: batch whatever is waiting, run it, answer the requester."""
-    limit_process_threads(cfg.cv_threads, cfg.torch_threads)
+    # Deliberately NOT capped to 1 like the workers: this process does the CPU-side
+    # preprocessing (letterbox/convert/stack) for every frame of every batch, and
+    # that work is serialized against the GPU. One thread here idles the GPU.
+    n_threads = int(getattr(cfg, "infer_threads", 0) or 0)
+    if n_threads <= 0:
+        n_threads = max(2, physical_cores() - max(0, int(getattr(cfg, "num_workers", 0))))
+    limit_process_threads(n_threads, n_threads)
     setup_logging(getattr(cfg, "log_level", "INFO"))
     logging.getLogger("ultralytics").setLevel(logging.ERROR)
     log = logging.getLogger("operator_monitor")
@@ -258,8 +266,8 @@ def _inference_process(cfg, spec: RingSpec, req_q, resp_qs: List[Any]) -> None:
         return
 
     max_wait = max(1, int(cfg.batch_max_wait_ms)) / 1000.0
-    log.info("Inference process up (batch<=%d, wait=%.0fms).", runner.max_batch,
-             max_wait * 1000)
+    log.info("Inference process up (batch<=%d, wait=%.0fms, threads=%d).",
+             runner.max_batch, max_wait * 1000, n_threads)
     stopping = False
     while not stopping:
         try:
