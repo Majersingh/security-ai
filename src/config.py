@@ -47,8 +47,8 @@ class Config:
     # (also caps how many feeds fit on one GPU, since cost scales ~quadratically):
     #   640  -> ~4x faster, many more feeds, but MISSES tiny/distant phones
     #   1280 -> reliably detects small phones in high-res CCTV, but ~4x heavier
-    # In batched mode this applies to the one shared model (all feeds use it).
-    inference_imgsz: int = 1280           # raise to 1280 if phones are small/far
+    # This applies to the one shared model, so it affects every feed at once.
+    inference_imgsz: int = 1280           # lower to 640 if throughput matters more
 
     # Process only every Nth frame (1 = every frame). E.g. on a 30 fps video,
     # frame_stride=30 analyses ~1 frame/second: much faster, coarser timing.

@@ -200,7 +200,8 @@ async def add_stream(payload: dict) -> JSONResponse:
         source = await loop.run_in_executor(
             None,
             lambda: StreamURLSource(
-                url, max_lag_s=max_lag, hw_decode=cfg.hw_decode
+                url, max_lag_s=max_lag, hw_decode=cfg.hw_decode,
+                stride=cfg.frame_stride,
             ).start(),
         )
     except Exception as exc:  # noqa: BLE001 - bad URL / unreachable stream

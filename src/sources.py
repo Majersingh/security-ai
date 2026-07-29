@@ -47,13 +47,17 @@ class StreamURLSource:
     def __init__(
         self, url: str, *, live: Optional[bool] = None, target_fps: Optional[float] = None,
         reconnect_backoff: float = 3.0, open_timeout: float = 15.0, max_lag_s: float = 0.0,
-        hw_decode: bool = True,
+        hw_decode: bool = True, stride: int = 1,
     ) -> None:
         self._url = url
         self.is_live = self._detect_live(url) if live is None else live
         self._target_fps = target_fps
         self._hw_decode = hw_decode
         self.hw_active = False           # True once a CUDA decoder is actually in use
+        # Frames whose index isn't a multiple of this are never converted to BGR.
+        # Set from Config.frame_stride so the saving reaches the decode stage
+        # instead of only the inference stage.
+        self._stride = max(1, int(stride))
         self._backoff = max(0.5, reconnect_backoff)
         self._open_timeout = open_timeout
         # >0 enables drop-when-behind: a frame more than this many seconds behind
@@ -146,10 +150,17 @@ class StreamURLSource:
     def frames(self) -> Iterator[Frame]:
         """Yield ``(index, BGR frame)`` sequentially, paced to the source fps.
 
+        Only frames that will actually be **used** get converted to BGR. The
+        YUV->BGR conversion (``to_ndarray``) is one of the most expensive
+        per-frame CPU operations in the whole pipeline, and under a stride most
+        decoded frames are thrown away — converting them first wasted that cost
+        on every discarded frame (at 80 feeds x 25 fps that is 2000 needless
+        720p conversions per second). Decode itself cannot be skipped, because
+        H.264/HEVC frames reference each other; the conversion can.
+
         Live sources reconnect on error/EOF; finite files stop at EOF. Pacing
         keeps fast (e.g. HTTP-downloaded) sources playing at natural speed and
-        smooths bursty HLS; if the consumer (inference) is slower than real time
-        it simply runs slower — no debt accumulates.
+        smooths bursty HLS.
         """
         idx = 0
         interval = 1.0 / self.fps if self.fps > 0 else 0.0
@@ -164,9 +175,9 @@ class StreamURLSource:
                     except StopIteration:
                         break
                     self.last_decode_ms = (time.monotonic() - t_dec) * 1000.0
-                    img = frame.to_ndarray(format="bgr24")
                     if self.width == 0 or self.height == 0:
-                        self.height, self.width = img.shape[:2]
+                        self.width = int(frame.width or 0)
+                        self.height = int(frame.height or 0)
                     drop = False
                     if interval:                       # pace to source fps
                         now = time.monotonic()
@@ -191,10 +202,12 @@ class StreamURLSource:
                             # Dropping disabled: never bank debt, or a slow consumer
                             # would make the source sprint to catch up later.
                             next_t = now
-                    if drop:
+                    # Skip BEFORE converting: a dropped or strided-out frame costs
+                    # only its decode, never a colourspace conversion.
+                    if drop or (self._stride > 1 and idx % self._stride):
                         idx += 1
-                        continue                       # frame dropped (not processed)
-                    yield idx, img
+                        continue
+                    yield idx, frame.to_ndarray(format="bgr24")
                     idx += 1
             except Exception as exc:  # noqa: BLE001 - decode/network hiccup
                 logger.warning("Stream decode error (%s): %s", self._url, exc)
