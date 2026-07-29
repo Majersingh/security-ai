@@ -281,7 +281,7 @@ def _inference_process(cfg, spec: RingSpec, req_q, resp_qs: List[Any]) -> None:
         ring.close()
         return
 
-    max_wait = max(1, int(cfg.batch_max_wait_ms)) / 1000.0
+    max_wait = max(0, int(cfg.batch_max_wait_ms)) / 1000.0   # 0 = never wait
     log.info("Inference process up (batch<=%d, wait=%.0fms, threads=%d).",
              runner.max_batch, max_wait * 1000, n_threads)
     stopping = False
@@ -293,14 +293,27 @@ def _inference_process(cfg, spec: RingSpec, req_q, resp_qs: List[Any]) -> None:
         if first is _SHUTDOWN:
             break
 
+        # Opportunistic batching: take whatever has ALREADY arrived; by default do
+        # not wait for frames that may never come.
+        #
+        # A fixed wait window is pure added latency whenever there aren't enough
+        # concurrent feeds to fill a batch, and it is *entirely* wasted at low feed
+        # counts: each feed has at most one frame in flight, so the frames the
+        # window is waiting for belong to feeds that are themselves blocked awaiting
+        # this batch. With one feed that cost a flat `batch_max_wait_ms` on every
+        # single frame. Under real load the backlog fills the batch immediately
+        # anyway, so draining non-blocking loses nothing where batching matters.
         batch: List[Request] = [first]
-        deadline = time.monotonic() + max_wait
-        while len(batch) < runner.max_batch:          # brief window to fill up
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+        deadline = time.monotonic() + max_wait if max_wait > 0 else 0.0
+        while len(batch) < runner.max_batch:
             try:
-                nxt = req_q.get(timeout=remaining)
+                if max_wait > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    nxt = req_q.get(timeout=remaining)
+                else:
+                    nxt = req_q.get_nowait()
             except pyqueue.Empty:
                 break
             except (EOFError, OSError):
@@ -483,7 +496,7 @@ class LocalInferencer:
     def __init__(self, cfg) -> None:
         self._cfg = cfg
         self._runner = ModelRunner(cfg)
-        self._max_wait = max(1, int(cfg.batch_max_wait_ms)) / 1000.0
+        self._max_wait = max(0, int(cfg.batch_max_wait_ms)) / 1000.0  # 0 = never wait
         self._queue: "asyncio.Queue[Tuple[np.ndarray, asyncio.Future]]" = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
 

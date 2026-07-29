@@ -125,7 +125,16 @@ class Config:
     # actually fill: N per-worker batchers would each see 1/N of the frames and
     # give back most of the batching win.
     batch_max_size: int = 16        # max frames combined into one GPU call
-    batch_max_wait_ms: int = 12     # how long to wait to fill a batch
+    # How long to WAIT for more frames before running a batch. 0 = don't wait, just
+    # take whatever already arrived (opportunistic batching).
+    #
+    # Keep this 0. A fixed window is pure latency whenever batches can't fill, and
+    # at low feed counts it is 100% wasted: each feed has at most one frame in
+    # flight, so the frames being waited for belong to feeds that are themselves
+    # blocked on this batch. Measured with ONE feed at 12ms: every frame paid a flat
+    # 12ms, ~a quarter of total detect latency. Under real load a backlog fills the
+    # batch with no waiting at all, so 0 costs nothing where batching pays.
+    batch_max_wait_ms: int = 0
 
     # Frames reach that process through a pool of fixed-size shared-memory slots;
     # pickling ~3 MB arrays through a queue at hundreds of fps would otherwise
