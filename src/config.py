@@ -144,6 +144,21 @@ class Config:
     infer_slot_max_height: int = 1088   # 1080p + slack
     infer_slot_max_width: int = 1920
 
+    # Source shapes to pre-warm the model on, as (height, width).
+    #
+    # What forces a cuDNN/CUDA re-autotune is the LETTERBOXED tensor shape, and that
+    # depends only on the source *aspect ratio* plus inference_imgsz — not on the
+    # resolution. At imgsz 1280, every 16:9 source (720p, 1080p, 1440p, 4K) becomes
+    # 1280x736, so one entry covers all of them; 4:3 becomes 1280x960. The list is
+    # deduped by preprocessed shape, so adding more same-aspect resolutions is free.
+    #
+    # This matters more than it looks: the first frame of an un-warmed shape stalls
+    # the SHARED inference process for ~1.7s, which stalls *every* feed, not just
+    # the new one. Add an entry per aspect ratio you actually deploy.
+    warmup_shapes: List[Tuple[int, int]] = field(
+        default_factory=lambda: [(1080, 1920), (480, 640)]      # 16:9, 4:3
+    )
+
     # ---- Viewer stream (browser delivery) ----
     # Annotated frames sent to browsers are throttled + shrunk INDEPENDENTLY of
     # detection, so remote viewing (especially over a tunnel) stays smooth even

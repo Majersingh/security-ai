@@ -95,17 +95,59 @@ class ModelRunner:
             s <<= 1
         self._sizes.append(self.max_batch)
 
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-        for n in self._sizes:
-            try:
-                self._predict_raw([dummy] * n)
-            except Exception as exc:  # noqa: BLE001 - warmup is optional
-                logger.warning("Warmup at batch=%d failed: %s", n, exc)
+        # Warm every (source aspect x batch size) combination we expect to see.
+        # The old warmup used a square 640x640 dummy, which at imgsz 1280 letterboxes
+        # to 1280x1280 — a tensor shape no real camera ever produces. So none of the
+        # warmup applied, and the first real frame paid the full autotune (~1.7s
+        # measured), stalling every feed on the shared process.
+        warm_src, warm_out = self._warmup_shapes(cfg)
+        for (h, w) in warm_src:
+            dummy = np.zeros((h, w, 3), dtype=np.uint8)
+            for n in self._sizes:
+                try:
+                    self._predict_raw([dummy] * n)
+                except Exception as exc:  # noqa: BLE001 - warmup is optional
+                    logger.warning("Warmup at %dx%d batch=%d failed: %s", w, h, n, exc)
         logger.info(
-            "Inference ready (device=%s, precision=%s, imgsz=%d, batch sizes=%s).",
+            "Inference ready (device=%s, precision=%s, imgsz=%d, batch sizes=%s, "
+            "warmed tensor shapes=%s).",
             self._device, "fp16" if self._quantize == 16 else "fp32",
             cfg.inference_imgsz, self._sizes,
+            [f"{w}x{h}" for (h, w) in warm_out],
         )
+
+    @staticmethod
+    def _warmup_shapes(cfg) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+        """Pick source shapes to warm, deduped by their *preprocessed* shape.
+
+        Returns ``(source_shapes, preprocessed_shapes)``. Only the letterboxed
+        tensor shape matters for autotuning, and that is a function of aspect ratio
+        and imgsz — so several configured resolutions sharing an aspect ratio
+        collapse to one warmup.
+        """
+        imgsz = int(cfg.inference_imgsz)
+        configured = list(getattr(cfg, "warmup_shapes", None) or [(1080, 1920)])
+        try:
+            from ultralytics.data.augment import LetterBox
+
+            lb = LetterBox((imgsz, imgsz), auto=True, stride=32)
+        except Exception:  # noqa: BLE001 - fall back to warming everything given
+            return configured, configured
+
+        seen: Dict[Tuple[int, int], bool] = {}
+        src: List[Tuple[int, int]] = []
+        out: List[Tuple[int, int]] = []
+        for h, w in configured:
+            h, w = int(h), int(w)
+            try:
+                shape = tuple(lb(image=np.zeros((h, w, 3), np.uint8)).shape[:2])
+            except Exception:  # noqa: BLE001
+                shape = (imgsz, imgsz)
+            if shape not in seen:
+                seen[shape] = True
+                src.append((h, w))
+                out.append(shape)
+        return src, out
 
     def pad_size(self, n: int) -> int:
         """Round a frame count up to the nearest pre-warmed batch size."""
