@@ -93,6 +93,7 @@ async def _worker_loop(
                     msg["url"], max_lag_s=max_lag,
                     hw_decode=getattr(cfg, "hw_decode", True),
                     stride=getattr(cfg, "frame_stride", 1),
+                    decode_threads=getattr(cfg, "decode_threads", 1),
                 ).start(),
             )
         except Exception as exc:  # noqa: BLE001

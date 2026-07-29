@@ -71,7 +71,13 @@ class ModelRunner:
         self._cfg = cfg
         self._device = resolve_device(cfg.device)
         dev = self._device.lower()
-        self._half = ("cuda" in dev) or dev.isdigit()      # FP16 on CUDA
+        fp16 = ("cuda" in dev) or dev.isdigit()
+        # Ultralytics 8.4 replaced `half=` with the unified `quantize=` scheme.
+        # `half=True` still works (it forwards to quantize=16) but logs a
+        # deprecation warning on EVERY predict call — at hundreds of calls/second
+        # that flood is itself a measurable cost in stderr I/O and lock contention.
+        # 16 = FP16, None = FP32.
+        self._quantize = 16 if fp16 else None
         self._keep = sorted({cfg.person_class_id, cfg.phone_class_id})
         self.max_batch = max(1, int(cfg.batch_max_size))
 
@@ -95,8 +101,9 @@ class ModelRunner:
             except Exception as exc:  # noqa: BLE001 - warmup is optional
                 logger.warning("Warmup at batch=%d failed: %s", n, exc)
         logger.info(
-            "Inference ready (device=%s, half=%s, imgsz=%d, batch sizes=%s).",
-            self._device, self._half, cfg.inference_imgsz, self._sizes,
+            "Inference ready (device=%s, precision=%s, imgsz=%d, batch sizes=%s).",
+            self._device, "fp16" if self._quantize == 16 else "fp32",
+            cfg.inference_imgsz, self._sizes,
         )
 
     def pad_size(self, n: int) -> int:
@@ -113,7 +120,7 @@ class ModelRunner:
             iou=self._cfg.iou_threshold,
             imgsz=self._cfg.inference_imgsz,
             device=self._device,
-            half=self._half,
+            quantize=self._quantize,
             classes=self._keep,
             verbose=False,
         )

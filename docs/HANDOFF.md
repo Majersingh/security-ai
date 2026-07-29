@@ -3,7 +3,42 @@
 Written 2026-07-30. Read `docs/ARCHITECTURE.md` §3, §4.4b, §5, phases 6–7 and §8
 first; this file is only the live state and the open thread.
 
-## The open problem (unsolved)
+## UPDATE — deployed run at 4 feeds is healthy
+
+Log from the GPU host at `frame_stride = 10`, 4 feeds:
+
+```
+BATCH n=1 predict=25ms (25ms/frame)
+TIMING 6366fbda f=200 | 1 pulled | decode=0ms pace=33ms infer=48ms emit=0ms | gap=339ms (2.9 proc-fps)
+```
+
+- **This is real time.** 30 fps source ÷ stride 10 = 3.0 proc-fps, and the log shows
+  2.8–3.2. `pace` being *positive* means the pipeline is sleeping waiting for the
+  source, i.e. it has spare capacity. `infer` fell 205ms → ~45ms.
+- **`BATCH n=1` always, and that is expected at this scale, not a bug.** 4 feeds ×
+  3 fps = 12 requests/s, one every ~83 ms, against a 12 ms batch window — there is
+  never a second frame waiting. It does mean full per-frame overhead with zero
+  batching benefit.
+- **Capacity ceiling to watch.** The inference process runs one batch at a time.
+  `predict=25ms` vs `infer=45ms` ⇒ ~20 ms per-frame overhead (IPC + shared mem +
+  Ultralytics preprocess + response). At `n=1` that caps aggregate throughput at
+  ~1000/45 ≈ **22 frames/s across all feeds** ≈ **7 feeds at 3 fps each**. That is
+  why 80 feeds showed `infer=205ms`.
+  Batching should relieve this automatically as a backlog forms (the drain loop
+  takes whatever is already queued without waiting), so the ceiling rises as `n`
+  grows. **Diagnostic: watch `BATCH n=` while adding feeds.** `n` climbing toward
+  16 with sub-linear `predict` growth = batching working. `n` stuck at 1–3 while
+  feeds fall behind = raise `batch_max_wait_ms`.
+- **Turn `log_timing` off once diagnosed.** Two log lines per frame per feed is
+  ~500 synchronous stderr writes/second at 80 feeds.
+
+Fixed off the back of this log (uncommitted): the `'half' is deprecated` flood
+(Ultralytics 8.4 renamed it to `quantize`; `half=True` *was* still honored — it
+forwards to `quantize=16` — so FP16 was never silently lost, but the warning fired
+on every predict call), and the TIMING accounting that the stride change broke
+(`pulled=1 pace=33ms` understated 10 decodes; now `pulled=10 pace=320ms`).
+
+## The original problem (CPU 99.9% at ~80 feeds — still the open thread)
 
 On the deployment box (**RTX 4070 Ti SUPER**, 17 cores visible, ~80 feeds of 720p
 H.264): **CPU pinned at 99.9% across all cores, GPU nearly idle.** Per-feed logs

@@ -112,6 +112,12 @@ class Config:
     # software automatically when no CUDA decoder is available.
     hw_decode: bool = True
 
+    # libav decode threads PER FEED. 0 = let libav decide, which means roughly one
+    # thread per core *per feed* — with many feeds that is hundreds of threads
+    # fighting over the same cores. Parallelism here comes from running many feeds,
+    # so each feed wants 1 decode thread. Raise only if running very few feeds.
+    decode_threads: int = 1
+
     # ---- Inference service (exactly ONE process owns the GPU) ----
     # Every feed, in every worker process, sends its frames to a single inference
     # process that holds the one model and combines whatever is waiting into one

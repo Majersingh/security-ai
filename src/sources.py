@@ -47,7 +47,7 @@ class StreamURLSource:
     def __init__(
         self, url: str, *, live: Optional[bool] = None, target_fps: Optional[float] = None,
         reconnect_backoff: float = 3.0, open_timeout: float = 15.0, max_lag_s: float = 0.0,
-        hw_decode: bool = True, stride: int = 1,
+        hw_decode: bool = True, stride: int = 1, decode_threads: int = 1,
     ) -> None:
         self._url = url
         self.is_live = self._detect_live(url) if live is None else live
@@ -58,6 +58,7 @@ class StreamURLSource:
         # Set from Config.frame_stride so the saving reaches the decode stage
         # instead of only the inference stage.
         self._stride = max(1, int(stride))
+        self._decode_threads = max(0, int(decode_threads))
         self._backoff = max(0.5, reconnect_backoff)
         self._open_timeout = open_timeout
         # >0 enables drop-when-behind: a frame more than this many seconds behind
@@ -75,6 +76,9 @@ class StreamURLSource:
         # real decode/network time; last_wait_ms is the pacing sleep (expected).
         self.last_decode_ms = 0.0
         self.last_wait_ms = 0.0
+        # Frames actually decoded to produce the last yielded frame (>1 under a
+        # stride), so the caller can report honest per-frame cost.
+        self.last_pulled = 1
 
     @classmethod
     def _detect_live(cls, url: str) -> bool:
@@ -126,8 +130,23 @@ class StreamURLSource:
 
         container = av.open(self._url, options=options, timeout=self._open_timeout)
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"          # software decode: use frame threading
+        self._apply_decode_threads(stream)
         return container, stream
+
+    def _apply_decode_threads(self, stream) -> None:
+        """Bound libav's per-feed decode threads.
+
+        Left alone, ``thread_count = 0`` lets libav use roughly one thread per core
+        *for every feed* — at 80 feeds on 17 cores that is hundreds of threads
+        competing for the same cores. Parallelism comes from feed count here, so
+        each feed gets one decode thread by default.
+        """
+        if self._decode_threads == 1:
+            stream.thread_type = "NONE"
+            stream.thread_count = 1
+        else:
+            stream.thread_type = "AUTO"      # few feeds: let libav frame-thread
+            stream.thread_count = self._decode_threads
 
     def start(self) -> "StreamURLSource":
         """Open the source and read its metadata (raises on failure)."""
@@ -165,6 +184,12 @@ class StreamURLSource:
         idx = 0
         interval = 1.0 / self.fps if self.fps > 0 else 0.0
         next_t = time.monotonic()
+        # Accumulated across the frames skipped inside this generator, so the
+        # caller's TIMING line still reports the REAL decode + pacing cost of
+        # producing one yielded frame. Without this, striding here would hide
+        # 9 of every 10 decodes from the caller and understate `pace`.
+        acc_decode = acc_wait = 0.0
+        acc_pulled = 0
         while not self._stop:
             try:
                 decoder = self._container.decode(self._stream)
@@ -174,7 +199,8 @@ class StreamURLSource:
                         frame = next(decoder)
                     except StopIteration:
                         break
-                    self.last_decode_ms = (time.monotonic() - t_dec) * 1000.0
+                    acc_decode += (time.monotonic() - t_dec) * 1000.0
+                    acc_pulled += 1
                     if self.width == 0 or self.height == 0:
                         self.width = int(frame.width or 0)
                         self.height = int(frame.height or 0)
@@ -182,7 +208,7 @@ class StreamURLSource:
                     if interval:                       # pace to source fps
                         now = time.monotonic()
                         delay = next_t - now
-                        self.last_wait_ms = max(0.0, delay) * 1000.0
+                        acc_wait += max(0.0, delay) * 1000.0
                         next_t += interval
                         if delay > 0:
                             time.sleep(delay)
@@ -207,6 +233,12 @@ class StreamURLSource:
                     if drop or (self._stride > 1 and idx % self._stride):
                         idx += 1
                         continue
+                    # Publish the real cost of this yielded frame, then reset.
+                    self.last_decode_ms = acc_decode
+                    self.last_wait_ms = acc_wait
+                    self.last_pulled = acc_pulled
+                    acc_decode = acc_wait = 0.0
+                    acc_pulled = 0
                     yield idx, frame.to_ndarray(format="bgr24")
                     idx += 1
             except Exception as exc:  # noqa: BLE001 - decode/network hiccup

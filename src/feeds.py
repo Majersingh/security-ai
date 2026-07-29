@@ -206,7 +206,8 @@ class Feed:
                 item = await loop.run_in_executor(None, _next, gen)
                 decode_accum += getattr(self._source, "last_decode_ms", 0.0)
                 pace_accum += getattr(self._source, "last_wait_ms", 0.0)
-                pulled += 1
+                # >1 when the source strided/dropped frames internally.
+                pulled += int(getattr(self._source, "last_pulled", 1) or 1)
                 if item is _SENTINEL:
                     break
                 raw_idx, frame = item
