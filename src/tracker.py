@@ -1,9 +1,9 @@
 """Track/entity routing stage.
 
-The actual tracking algorithm (ByteTrack) runs inside the detector's built-in
-tracker (see :meth:`detector.Detector.track`). This module owns the *identity
-policy*: it turns the raw tracked detections into the two clean streams the
-behaviour layer needs.
+The actual tracking algorithm (ByteTrack) runs per-feed in
+:class:`streaming.FrameProcessor`, fed by the shared model's detections. This
+module owns the *identity policy*: it turns the raw tracked detections into the
+two clean streams the behaviour layer needs.
 
 * persons  -- only those with a valid, persistent ``tracker_id``
 * phones   -- tracker ids stripped (we re-associate phones to a person each
@@ -31,7 +31,7 @@ class Tracker:
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        logger.info("Tracker routing ready (tracker=%s).", config.tracker_config)
+        logger.info("Tracker routing ready.")
 
     def route(
         self, detections: sv.Detections

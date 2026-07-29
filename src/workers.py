@@ -2,13 +2,23 @@
 
 The web process becomes a thin **coordinator**: it assigns each feed to a worker
 **process** and relays that worker's result frames/events to browsers. Each
-worker runs the full per-feed pipeline (decode → detect → track → annotate →
-encode) in its own process (own GIL) and shares the one GPU. This is what lets
-many feeds run in parallel when the bottleneck is CPU-bound per-feed work.
+worker owns the CPU-bound half of the pipeline for its feeds (decode → track →
+rules → annotate → encode) in its own process, with its own GIL. That is where
+the parallelism comes from, because that CPU work — not the GPU — is the
+bottleneck at scale.
+
+Workers do **not** own the GPU. Detection is centralized in one inference process
+(:mod:`inference`) that all workers share, so there is one CUDA context, one copy
+of the weights, and one batch queue deep enough to be worth batching.
 
 Enabled when ``Config.num_workers > 0``. IPC is plain ``multiprocessing`` queues
 (spawn context, required for CUDA): one control queue per worker (coordinator →
-worker) and one shared result queue (workers → coordinator).
+worker), one shared result queue (workers → coordinator), and the inference
+service's own request/response queues plus its shared-memory frame ring.
+
+Each process caps its own OpenCV/torch thread pools (``Config.cv_threads`` /
+``torch_threads``): with N processes on one box, every process sizing its pool
+from the machine's core count oversubscribes the CPU N-fold.
 """
 
 from __future__ import annotations
@@ -29,25 +39,34 @@ logger = logging.getLogger("operator_monitor")
 
 # ----------------------------- worker process -----------------------------
 
-def _worker_process(worker_id: int, cfg, ctrl_q: "mp.Queue", result_q: "mp.Queue") -> None:
+def _worker_process(
+    worker_id: int, cfg, ctrl_q: "mp.Queue", result_q: "mp.Queue", infer_args: tuple,
+) -> None:
     """Entry point for a worker process (spawned)."""
-    from utils import setup_logging
+    # Before anything imports torch/cv2: cap this process's thread pools.
+    from utils import limit_process_threads, setup_logging
+    limit_process_threads(cfg.cv_threads, cfg.torch_threads)
     setup_logging(getattr(cfg, "log_level", "INFO"))
     logging.getLogger("ultralytics").setLevel(logging.ERROR)
     log = logging.getLogger("operator_monitor")
     log.info("Worker %d up (pid=%d).", worker_id, os.getpid())
     try:
-        asyncio.run(_worker_loop(worker_id, cfg, ctrl_q, result_q))
+        asyncio.run(_worker_loop(worker_id, cfg, ctrl_q, result_q, infer_args))
     except Exception:  # noqa: BLE001
         log.exception("Worker %d crashed", worker_id)
 
 
-async def _worker_loop(worker_id: int, cfg, ctrl_q: "mp.Queue", result_q: "mp.Queue") -> None:
+async def _worker_loop(
+    worker_id: int, cfg, ctrl_q: "mp.Queue", result_q: "mp.Queue", infer_args: tuple,
+) -> None:
     from feeds import FeedManager
+    from inference import InferenceClient
     from sources import StreamURLSource
 
     loop = asyncio.get_event_loop()
-    mgr = FeedManager(cfg)
+    # This worker's handle on the shared inference process (needs a running loop).
+    client = InferenceClient(worker_id, *infer_args).start()
+    mgr = FeedManager(cfg, inferencer=client)
     feeds: Dict[str, object] = {}
     max_lag = cfg.stream_max_lag_seconds if getattr(cfg, "drop_when_behind", False) else 0.0
 
@@ -69,7 +88,11 @@ async def _worker_loop(worker_id: int, cfg, ctrl_q: "mp.Queue", result_q: "mp.Qu
         feed_id = msg["feed_id"]
         try:
             source = await loop.run_in_executor(
-                None, lambda: StreamURLSource(msg["url"], max_lag_s=max_lag).start()
+                None,
+                lambda: StreamURLSource(
+                    msg["url"], max_lag_s=max_lag,
+                    hw_decode=getattr(cfg, "hw_decode", True),
+                ).start(),
             )
         except Exception as exc:  # noqa: BLE001
             result_q.put((feed_id, {"type": "error", "feed_id": feed_id,
@@ -108,6 +131,10 @@ async def _worker_loop(worker_id: int, cfg, ctrl_q: "mp.Queue", result_q: "mp.Qu
                 f.set_viewing(msg.get("on", False))
         elif cmd == "shutdown":
             break
+
+    for f in list(feeds.values()):          # ask running feeds to wind down
+        f.stop()
+    mgr.shutdown()                          # detaches shared memory, stops pools
 
 
 # ----------------------------- coordinator side -----------------------------
@@ -148,13 +175,20 @@ class WorkerPool:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._drain_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._inference = None                        # the single GPU owner
 
     def start(self) -> "WorkerPool":
+        from inference import InferenceService
+
         self._loop = asyncio.get_event_loop()
+        # Start the GPU owner first: workers attach to its queues + frame ring.
+        self._inference = InferenceService(self._cfg, self._ctx, self._n).start()
         for wid in range(self._n):
             ctrl_q = self._ctx.Queue()
             p = self._ctx.Process(
-                target=_worker_process, args=(wid, self._cfg, ctrl_q, self._result_q),
+                target=_worker_process,
+                args=(wid, self._cfg, ctrl_q, self._result_q,
+                      self._inference.client_args(wid)),
                 name=f"cctv-worker-{wid}", daemon=True,
             )
             p.start()
@@ -162,7 +196,9 @@ class WorkerPool:
             self._procs.append(p)
         self._drain_thread = threading.Thread(target=self._drain, name="result-drain", daemon=True)
         self._drain_thread.start()
-        logger.info("WorkerPool started: %d worker process(es).", self._n)
+        logger.info(
+            "WorkerPool started: %d worker process(es) + 1 inference process.", self._n
+        )
         return self
 
     def shutdown(self) -> None:
@@ -176,6 +212,9 @@ class WorkerPool:
             p.join(timeout=3)
             if p.is_alive():
                 p.terminate()
+        # Workers are gone -> nothing is reading the ring; safe to unlink it.
+        if self._inference is not None:
+            self._inference.shutdown()
 
     # ---- feed lifecycle ----
     def add_stream(self, url: str, name: str, zone, line_start, line_end) -> Optional[str]:

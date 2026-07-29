@@ -1,8 +1,9 @@
 """FastAPI server for the multi-feed live-stream monitoring UI.
 
 The system processes **live stream URLs** (RTSP / HLS / HTTP). Each stream is a
-background :class:`feeds.Feed` that decodes with PyAV, runs detection through a
-shared GPU gate, and broadcasts annotated frames + events to any viewers.
+background :class:`feeds.Feed` that decodes with PyAV (NVDEC when available), gets
+its detections from the one shared inference process, and broadcasts annotated
+frames + events to any viewers.
 
 Endpoints
 ---------
@@ -33,9 +34,14 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from contextlib import asynccontextmanager  # noqa: E402
 
 from config import Config  # noqa: E402
+from utils import limit_process_threads, resolve_device, setup_logging  # noqa: E402
+
+# Cap this process's intra-op thread pools BEFORE the imports below drag in
+# torch/OpenCV — the env vars they read are only consulted at import time.
+limit_process_threads(Config().cv_threads, Config().torch_threads)
+
 from feeds import FeedManager  # noqa: E402
 from sources import StreamURLSource  # noqa: E402
-from utils import resolve_device, setup_logging  # noqa: E402
 
 logger = setup_logging("INFO")
 
@@ -74,13 +80,17 @@ async def lifespan(app: "FastAPI"):
     logger.info("Server starting up…")
     _log_hardware()
     cfg = Config()
-    # num_workers>0: coordinator mode (worker processes escape the GIL for true
-    # parallelism). 0: everything in this process (fine for a few feeds).
+    # num_workers>0: coordinator mode — N worker processes for the CPU-bound work
+    # plus one inference process that owns the GPU. 0: everything here, in-process
+    # (simple, no shared memory; the right mode for a few feeds or a CPU-only box).
     if getattr(cfg, "num_workers", 0) and cfg.num_workers > 0:
         from workers import WorkerPool
         app.state.pool = WorkerPool(cfg).start()
         app.state.feeds = None
-        logger.info("Coordinator mode: %d worker process(es).", cfg.num_workers)
+        logger.info(
+            "Coordinator mode: %d worker process(es), cv_threads=%d, torch_threads=%d.",
+            cfg.num_workers, cfg.cv_threads, cfg.torch_threads,
+        )
     else:
         app.state.pool = None
         app.state.feeds = FeedManager(cfg)
@@ -88,6 +98,8 @@ async def lifespan(app: "FastAPI"):
     yield
     if getattr(app.state, "pool", None) is not None:
         app.state.pool.shutdown()
+    if getattr(app.state, "feeds", None) is not None:
+        app.state.feeds.shutdown()
     logger.info("Server shutting down.")
 
 
@@ -186,7 +198,10 @@ async def add_stream(payload: dict) -> JSONResponse:
     max_lag = cfg.stream_max_lag_seconds if cfg.drop_when_behind else 0.0
     try:
         source = await loop.run_in_executor(
-            None, lambda: StreamURLSource(url, max_lag_s=max_lag).start()
+            None,
+            lambda: StreamURLSource(
+                url, max_lag_s=max_lag, hw_decode=cfg.hw_decode
+            ).start(),
         )
     except Exception as exc:  # noqa: BLE001 - bad URL / unreachable stream
         return JSONResponse({"error": f"could not open stream: {exc}"}, status_code=400)

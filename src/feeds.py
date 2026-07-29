@@ -1,15 +1,15 @@
-"""Concurrent multi-feed orchestration for a single GPU.
+"""Concurrent multi-feed orchestration.
 
-Each :class:`Feed` owns its own :class:`FrameProcessor` — and therefore its own
-YOLO model instance. This is mandatory, not a choice: Ultralytics keeps tracker
-state *on the model object* (``model.track(persist=True)``), so two feeds sharing
-one model would corrupt each other's track IDs. VRAM is what caps the feed count
-(``Config.max_feeds``).
+Each :class:`Feed` owns its own :class:`FrameProcessor` — its tracker, rules,
+event log and annotator — but **not** a model. Detection is centralized: one
+model in one process serves every feed (see :mod:`inference`), and each feed
+keeps its identities separate with its own ``supervision.ByteTrack``. So what
+caps the feed count is CPU throughput for decode/track/annotate/encode, not VRAM.
 
-All feeds share **one** :class:`FeedManager`, whose GPU gate (an
-``asyncio.Semaphore``) serializes inference so N feeds don't thrash the single
-GPU. Decode happens in parallel (cheap, libav); only the model forward pass is
-gated.
+All feeds in a process share **one** :class:`FeedManager`, which holds the
+inference handle and a small thread pool for the post-detection CPU work. The
+handle is either an in-process batcher or a client for the inference process;
+:class:`FeedManager` doesn't care which.
 
 A ``Feed`` is transport-agnostic: it drives a source and emits result dicts to an
 async ``on_update`` callback. The web layer wires that callback to a WebSocket;
@@ -180,14 +180,13 @@ class Feed:
         self._on_update = on_update
         zone, line_start, line_end = self._geom
         try:
-            # Model load is heavy -> build the processor off the event loop.
+            # Building rules/tracker/annotator touches disk -> off the event loop.
             self._proc = await loop.run_in_executor(
                 None,
                 lambda: FrameProcessor(
                     self._cfg, self._source.fps,
                     processing_fps=self._source.fps / self._stride,
                     zone_polygon=zone, line_start=line_start, line_end=line_end,
-                    batched=self._manager.batched,
                 ),
             )
             self.info.status = "running"
@@ -225,14 +224,9 @@ class Feed:
                 )
 
                 t_inf = time.monotonic()
-                if self._manager.batched:
-                    payload = await self._manager.infer_batched(
-                        self._proc, frame, raw_idx, annotated=want_image
-                    )
-                else:
-                    payload = await self._manager.infer(
-                        self._proc, frame, raw_idx, annotated=want_image
-                    )
+                payload = await self._manager.infer(
+                    self._proc, frame, raw_idx, annotated=want_image
+                )
                 infer_ms = (time.monotonic() - t_inf) * 1000.0
                 events = payload.get("events") or []
                 payload.update({
@@ -302,33 +296,32 @@ class Feed:
 
 
 class FeedManager:
-    """Registry of active feeds + the shared GPU gate for the whole process."""
+    """Registry of active feeds + this process's handle on inference."""
 
-    def __init__(self, cfg: Optional[Config] = None) -> None:
+    def __init__(self, cfg: Optional[Config] = None, inferencer=None) -> None:
         cfg = cfg or Config()
+        self._cfg = cfg
         self.max_feeds = int(getattr(cfg, "max_feeds", 8))
-        depth = max(1, int(getattr(cfg, "max_concurrent_inferences", 2)))
-        self._gate = asyncio.Semaphore(depth)
-        # A small pool for the post-detection work (track/rules/annotate/encode).
-        # Sized a bit above the gate depth so batched feeds aren't thread-starved.
-        self._infer_pool = ThreadPoolExecutor(
-            max_workers=max(depth, 8), thread_name_prefix="infer"
+        # Post-detection work (track/rules/annotate/JPEG-encode) is CPU-bound but
+        # releases the GIL in OpenCV/NumPy, so a small thread pool is the right
+        # shape. Kept modest on purpose: real parallelism comes from having
+        # several worker processes, and each process is thread-capped.
+        self._post_pool = ThreadPoolExecutor(
+            max_workers=max(2, int(getattr(cfg, "cv_threads", 1)) * 4),
+            thread_name_prefix="post",
         )
         self._feeds: dict[str, Feed] = {}
         self._event_subs: Set[asyncio.Queue] = set()   # global events (all feeds)
 
-        # Batched inference: ONE shared model for all feeds (see batch.py).
-        self.batched = bool(getattr(cfg, "batched_inference", False))
-        self._batcher = None
-        if self.batched:
-            from batch import BatchInferencer  # local import: optional dependency path
-            self._batcher = BatchInferencer(cfg).start()
-        logger.info(
-            "FeedManager ready: max_feeds=%d, mode=%s%s.",
-            self.max_feeds,
-            "batched" if self.batched else "per-feed-model",
-            "" if self.batched else f", gpu_gate_depth={depth}",
-        )
+        # Inference handle: an InferenceClient (GPU lives in another process) or a
+        # LocalInferencer (num_workers == 0). Both expose `await infer(frame)`.
+        if inferencer is None:
+            from inference import LocalInferencer
+
+            inferencer = LocalInferencer(cfg).start()
+        self._inferencer = inferencer
+        logger.info("FeedManager ready: max_feeds=%d, inference=%s.",
+                    self.max_feeds, type(inferencer).__name__)
 
     def create(
         self, source: FrameSource, cfg: Config, zone, line_start, line_end,
@@ -397,27 +390,29 @@ class FeedManager:
     async def infer(
         self, proc: FrameProcessor, frame, frame_index: int, annotated: bool = False,
     ) -> dict:
-        """Run one frame through the model (serialized by the shared GPU gate)
-        and return a partial result payload.
+        """Process one frame and return a partial result payload.
+
+        Two stages, deliberately split: the shared model detects (this frame is
+        batched with other feeds' frames, wherever the GPU lives), then this
+        feed's own track/rules/annotate runs in a post-processing thread.
 
         ``annotated=False`` -> ``{boxes, events, w, h}`` (upload feeds; the browser
         draws the boxes). ``annotated=True`` -> ``{image, events, w, h}`` with a
         base64 JPEG of the annotated frame (stream feeds; no local video exists).
         """
+        detections = await self._inferencer.infer(frame)      # awaits the batch
         loop = asyncio.get_event_loop()
         fn = self._infer_annotated if annotated else self._infer_boxes
-        async with self._gate:
-            return await loop.run_in_executor(self._infer_pool, fn, proc, frame, frame_index)
+        return await loop.run_in_executor(
+            self._post_pool, fn, proc, frame, frame_index, detections
+        )
 
-    async def infer_batched(
-        self, proc: FrameProcessor, frame, frame_index: int, annotated: bool = False,
-    ) -> dict:
-        """Batched path: the shared model detects (combined with other feeds in
-        one GPU call); the per-feed track/rules/annotate runs in a worker thread."""
-        detections = await self._batcher.infer(frame)     # awaits the batch (GPU)
-        loop = asyncio.get_event_loop()
-        fn = self._infer_annotated if annotated else self._infer_boxes
-        return await loop.run_in_executor(self._infer_pool, fn, proc, frame, frame_index, detections)
+    def shutdown(self) -> None:
+        """Release the inference handle and the post-processing pool."""
+        shut = getattr(self._inferencer, "shutdown", None)
+        if callable(shut):
+            shut()
+        self._post_pool.shutdown(wait=False)
 
     @staticmethod
     def _infer_boxes(proc: FrameProcessor, frame, frame_index: int, detections=None) -> dict:

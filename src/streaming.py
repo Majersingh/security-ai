@@ -1,10 +1,14 @@
 """Per-frame processing core for the live-stream pipeline.
 
-:class:`FrameProcessor` wraps detector / tracker / behaviour engine / annotator
-and processes ONE frame at a time, returning either an annotated frame or plain
-detection data plus any events that fired. Tracking state persists across calls,
-so it drives a live stream frame by frame. It is used by :mod:`feeds`, which owns
-one processor (and thus one model) per feed.
+:class:`FrameProcessor` wraps tracker / behaviour engine / annotator and processes
+ONE frame at a time, returning either an annotated frame or plain detection data
+plus any events that fired.
+
+It does **not** own a model. Detections are supplied by the shared model in the
+inference process (see :mod:`inference`); what lives here is the per-feed state
+that must not be shared — identity tracking, the rule state machine, the event
+log. Tracking state persists across calls, so it drives a live stream frame by
+frame. :mod:`feeds` owns one processor per feed.
 """
 
 from __future__ import annotations
@@ -21,7 +25,6 @@ from annotator import Annotator
 from behavior import BehaviorEngine, build_rules
 from config import Config
 from events import Event, EventLog, SnapshotManager
-from detector import Detector
 from tracker import Tracker
 from utils import BBox  # noqa: F401  (re-exported for type users)
 
@@ -41,25 +44,19 @@ class FrameProcessor:
         zone_polygon: Optional[List[Point]] = None,
         line_start: Optional[Point] = None,
         line_end: Optional[Point] = None,
-        batched: bool = False,
     ) -> None:
         # zone/line coordinates are *normalized* (0..1 fractions of width/height)
         # so they are independent of the frame resolution. They are scaled to
         # pixels lazily on the first frame, once the real frame size is known.
         self._config = config
         config.ensure_output_dirs()
-        # Batched mode: a shared model does detection elsewhere and hands us the
-        # detections; this feed owns only its identity tracker (supervision
-        # ByteTrack). Non-batched: this feed owns a full Detector (model + tracker).
-        self._batched = batched
-        if batched:
-            self._detector = None
-            self._bytetrack = sv.ByteTrack(
-                frame_rate=max(1, int(round(processing_fps or fps or 30)))
-            )
-        else:
-            self._detector = Detector(config)
-            self._bytetrack = None
+        # The shared model detects statelessly for all feeds, so identity is this
+        # feed's own problem: its private ByteTrack is what keeps track ids from
+        # bleeding between feeds.
+        self._bytetrack = sv.ByteTrack(
+            frame_rate=max(1, int(round(processing_fps or fps or 30))),
+            lost_track_buffer=max(1, int(getattr(config, "track_buffer_frames", 30))),
+        )
         self._tracker = Tracker(config)
         self._event_log = EventLog(config)
         self._snapshots = SnapshotManager(config)
@@ -104,10 +101,11 @@ class FrameProcessor:
         )
 
     def _run(self, frame: np.ndarray, frame_index: int, detections=None):
-        """Shared core: detect -> track -> rules. Returns raw results.
+        """Shared core: track -> rules. Returns raw results.
 
-        In batched mode ``detections`` are supplied by the shared model; otherwise
-        this processor's own detector produces them.
+        ``detections`` come from the shared model. ``None`` is treated as "nothing
+        detected in this frame" rather than an error, so a dropped batch degrades
+        into a quiet frame instead of killing the feed.
         """
         pending = self._pending_geom
         if pending is not None:                       # geometry changed at runtime
@@ -118,13 +116,10 @@ class FrameProcessor:
             h, w = frame.shape[:2]
             self._build_engine(w, h)
         before = len(self._event_log)
-        if self._batched:
-            # Detection came from the shared batched model; track identities here.
-            tracked = self._bytetrack.update_with_detections(detections)
-            persons, phones = self._tracker.route(tracked)
-        else:
-            det = self._detector.track(frame)   # own model: fused detect + track
-            persons, phones = self._tracker.route(det)
+        if detections is None:
+            detections = sv.Detections.empty()
+        tracked = self._bytetrack.update_with_detections(detections)
+        persons, phones = self._tracker.route(tracked)
         result = self._engine.process(persons, phones, frame_index, frame)
         new_events = self._event_log.events[before:]
         return persons, phones, result, new_events

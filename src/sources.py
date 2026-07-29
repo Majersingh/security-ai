@@ -4,6 +4,11 @@ Uses PyAV (in-process libav) to decode a stream URL (RTSP / HLS / HTTP) or a
 plain video file URL. Snapshots and ``events.csv`` are the only artefacts, and
 those are written downstream by the pipeline — not here.
 
+Decode is the single largest CPU cost per feed, and on an NVIDIA host the GPU's
+decode engines are otherwise idle, so this asks libav for CUDA (NVDEC) hardware
+decode and falls back to software automatically. The first failure is cached for
+the whole process, so a CPU-only box pays the probe once rather than per feed.
+
 Decoding is **sequential and paced** (every frame, in order, at the source's
 frame rate) so playback is smooth and frame numbers are contiguous. A source is
 either:
@@ -35,13 +40,20 @@ class StreamURLSource:
     _LIVE_SCHEMES = ("rtsp://", "rtmp://", "udp://", "srt://", "rtp://")
     _LIVE_EXTS = (".m3u8", ".m3u", ".mpd")
 
+    # Per-process cache of whether CUDA decode works here: None = not yet probed,
+    # False = probed and unavailable (stop trying), True = in use.
+    _hw_supported: Optional[bool] = None
+
     def __init__(
         self, url: str, *, live: Optional[bool] = None, target_fps: Optional[float] = None,
         reconnect_backoff: float = 3.0, open_timeout: float = 15.0, max_lag_s: float = 0.0,
+        hw_decode: bool = True,
     ) -> None:
         self._url = url
         self.is_live = self._detect_live(url) if live is None else live
         self._target_fps = target_fps
+        self._hw_decode = hw_decode
+        self.hw_active = False           # True once a CUDA decoder is actually in use
         self._backoff = max(0.5, reconnect_backoff)
         self._open_timeout = open_timeout
         # >0 enables drop-when-behind: a frame more than this many seconds behind
@@ -68,14 +80,49 @@ class StreamURLSource:
         path = u.split("?", 1)[0]
         return path.endswith(cls._LIVE_EXTS)
 
+    def _hwaccel(self):
+        """A CUDA hwaccel spec, or ``None`` to decode on the CPU."""
+        if not self._hw_decode or type(self)._hw_supported is False:
+            return None
+        try:
+            from av.codec.hwaccel import HWAccel
+
+            # allow_software_fallback: if this stream's codec has no CUDA decoder
+            # (odd CCTV codecs happen), libav quietly uses the software one.
+            return HWAccel(device_type="cuda", allow_software_fallback=True)
+        except Exception as exc:  # noqa: BLE001 - no hwaccel support in this build
+            logger.debug("CUDA hwaccel unavailable: %s", exc)
+            type(self)._hw_supported = False
+            return None
+
     def _open(self):
         options = {}
         if self._url.lower().startswith("rtsp"):
             options["rtsp_transport"] = "tcp"    # TCP is more reliable than UDP
             options["stimeout"] = "5000000"      # 5s socket timeout (microseconds)
+
+        hwaccel = self._hwaccel()
+        if hwaccel is not None:
+            try:
+                container = av.open(self._url, options=options,
+                                    timeout=self._open_timeout, hwaccel=hwaccel)
+                if type(self)._hw_supported is None:
+                    logger.info("NVDEC hardware decode active.")
+                type(self)._hw_supported = True
+                self.hw_active = True
+                stream = container.streams.video[0]
+                # Frames are downloaded to system memory on access; the win is not
+                # paying for H.264/HEVC decode on the CPU.
+                return container, stream
+            except Exception as exc:  # noqa: BLE001 - no GPU / no CUDA decoder
+                if type(self)._hw_supported is None:
+                    logger.info("CUDA decode unavailable (%s); using software decode.", exc)
+                type(self)._hw_supported = False
+                self.hw_active = False
+
         container = av.open(self._url, options=options, timeout=self._open_timeout)
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
+        stream.thread_type = "AUTO"          # software decode: use frame threading
         return container, stream
 
     def start(self) -> "StreamURLSource":
@@ -89,9 +136,10 @@ class StreamURLSource:
             self.fps = float(rate)
         self.total_frames = 0 if self.is_live else int(self._stream.frames or 0)
         logger.info(
-            "StreamURLSource open: %s (%s, %dx%d @ %.2f fps, total_frames=%d).",
+            "StreamURLSource open: %s (%s, %dx%d @ %.2f fps, total_frames=%d, decode=%s).",
             self._url, "live" if self.is_live else "file",
             self.width, self.height, self.fps, self.total_frames,
+            "nvdec" if self.hw_active else "cpu",
         )
         return self
 

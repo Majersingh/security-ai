@@ -22,11 +22,12 @@ phases plug in without touching the core loop:
 
 ```
 web/server.py   FastAPI: /feeds/* REST + WebSocket transport (stream-only)
-sources.py      StreamURLSource: PyAV decode of RTSP/HLS/HTTP (drop-to-latest)
-feeds.py        Feed + FeedManager: concurrent feeds on one GPU (shared gate)
-streaming.py    FrameProcessor: per-frame detect -> track -> rules -> annotate
-detector.py     Detector:       YOLOv11 -> person + phone detections only
-tracker.py      Tracker:        ByteTrack -> persistent person IDs
+sources.py      StreamURLSource: PyAV decode of RTSP/HLS/HTTP (NVDEC when available)
+feeds.py        Feed + FeedManager: concurrent feeds, per-process registry
+workers.py      WorkerPool: coordinator + N worker processes (the CPU-bound work)
+inference.py    ONE process owns the GPU: shared model, batching, shared-mem ring
+streaming.py    FrameProcessor: per-frame track -> rules -> annotate (no model)
+tracker.py      Tracker:        routes tracked detections to persons / phones
 behavior.py     BehaviorEngine + BehaviorRule + PhoneUsageRule / Zone / Line
                                 business logic, debounced into episodes
 annotator.py    Annotator:      draws green/blue/red boxes + labels
@@ -195,9 +196,13 @@ per feed (e.g. `inference_imgsz`).
 | `proximity_margin` | 0.15 | Person box inflation when testing "near" |
 | `min_containment` | 0.30 | Fraction of phone inside person to count |
 | `snapshot_cooldown_seconds` | 5.0 | Gap between snapshots in one episode |
-| `inference_imgsz` | 1280 | Detection resolution (accuracy vs speed); the server uses 640 for live streams |
-| `max_feeds` | 8 | Max concurrent feeds (VRAM ceiling) |
-| `max_concurrent_inferences` | 2 | GPU gate depth shared across all feeds |
+| `inference_imgsz` | 1280 | Detection resolution (accuracy vs speed); cost scales ~quadratically |
+| `frame_stride` | 1 | Process every Nth frame — with `inference_imgsz`, the main throughput dial |
+| `max_feeds` | 80 | Admission limit on concurrent feeds (not a VRAM ceiling) |
+| `num_workers` | physical cores (max 8) | Worker processes for decode/track/annotate; 0 = all in-process |
+| `cv_threads` / `torch_threads` | 1 | Per-process thread caps, so N processes don't oversubscribe the CPU |
+| `hw_decode` | True | NVDEC hardware decode, with automatic software fallback |
+| `batch_max_size` / `batch_max_wait_ms` | 16 / 12 | Batching in the single inference process |
 
 Time-based thresholds are expressed in **seconds** and converted to frames using
 each stream's real FPS, so "1 second of phone use" means 1 real second across

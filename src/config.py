@@ -11,10 +11,11 @@ whether the source is 15, 25 or 30 fps.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from utils import physical_cores
 
 # Project root = one level above this ``src`` directory.
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent
@@ -55,9 +56,10 @@ class Config:
     frame_stride: int = 1
 
     # ---------------------------------------------------------------- tracker
-    # Ultralytics built-in tracker config: "bytetrack.yaml" or "botsort.yaml".
-    tracker_config: str = "bytetrack.yaml"
-    persist_tracks: bool = True          # keep ids stable across frames
+    # Identity tracking is per-feed (supervision.ByteTrack in FrameProcessor),
+    # because the one shared model does detection statelessly for all feeds.
+    # Frames a track can be missing before its id is retired.
+    track_buffer_frames: int = 30
 
     # -------------------------------------------------------------- behaviour
     # A phone counts as "in use" when it is close to a person. We inflate the
@@ -92,14 +94,10 @@ class Config:
 
     # --------------------------------------------------------------- runtime
     log_level: str = "INFO"
-    log_timing: bool = True  # per-frame TIMING lines (profiling; noisy — off by default)
+    log_timing: bool = True  # per-frame TIMING lines (profiling; noisy, and ON here)
 
     # ------------------------------------------------- multi-feed (concurrent)
     max_feeds: int = 80
-    # Non-batched path only: inference is serialized by a shared GPU gate this
-    # many deep. Keep this SMALL (2-4) — a high value makes many feeds thrash the
-    # GPU + GIL and *lowers* throughput. Ignored when batched_inference is on.
-    max_concurrent_inferences: int = 4
 
     # Drop-when-behind: if a feed can't keep up with real time, skip stale frames
     # so latency stays bounded instead of growing forever (matters under load /
@@ -108,14 +106,28 @@ class Config:
     drop_when_behind: bool = True
     stream_max_lag_seconds: float = 0.5
 
-    # ---- Batched inference (throughput unlock for many feeds on one GPU) ----
-    # When on, ALL feeds share ONE model and their frames are combined into a
-    # single batched predict() call (far more GPU-efficient than one-at-a-time).
-    # Tracking then runs per-feed via supervision.ByteTrack (the model is used
-    # statelessly). When off, each feed gets its own model + the GPU gate above.
-    batched_inference: bool = True
+    # Hardware-accelerated decode (NVDEC on NVIDIA). Software H.264/HEVC decode is
+    # the largest CPU cost per feed and the GPU's decode engines are otherwise
+    # idle, so this is what actually raises the feed ceiling. Falls back to
+    # software automatically when no CUDA decoder is available.
+    hw_decode: bool = True
+
+    # ---- Inference service (exactly ONE process owns the GPU) ----
+    # Every feed, in every worker process, sends its frames to a single inference
+    # process that holds the one model and combines whatever is waiting into one
+    # predict() call. One CUDA context, one set of weights, and batches that
+    # actually fill: N per-worker batchers would each see 1/N of the frames and
+    # give back most of the batching win.
     batch_max_size: int = 16        # max frames combined into one GPU call
     batch_max_wait_ms: int = 12     # how long to wait to fill a batch
+
+    # Frames reach that process through a pool of fixed-size shared-memory slots;
+    # pickling ~3 MB arrays through a queue at hundreds of fps would otherwise
+    # dominate the cost. A frame too large for a slot falls back to the queue.
+    # Shared memory used = infer_slots * slot_max_height * slot_max_width * 3.
+    infer_slots: int = 64
+    infer_slot_max_height: int = 1088   # 1080p + slack
+    infer_slot_max_width: int = 1920
 
     # ---- Viewer stream (browser delivery) ----
     # Annotated frames sent to browsers are throttled + shrunk INDEPENDENTLY of
@@ -127,13 +139,21 @@ class Config:
     viewer_jpeg_quality: int = 45
 
     # ---- Multiprocess workers (escape the single-process GIL) ----
-    # 0 = run everything in the web process (fine for a few feeds). >0 = spawn N
-    # worker processes; the web process becomes a thin coordinator that assigns
-    # feeds to workers and relays their frames/events. Each worker runs the full
-    # pipeline for its feeds in parallel (own GIL) and shares the GPU. Default
-    # auto-sizes to the CPU cores (capped), since the bottleneck is CPU-bound
-    # per-feed work (decode/track/annotate/encode).
-    num_workers: int = field(default_factory=lambda: min(os.cpu_count() or 4, 8))
+    # 0 = run everything in the web process: simple, no shared memory, no
+    # inference process — the right mode for a few feeds and for CPU-only hosts.
+    # >0 = spawn N worker processes; the web process becomes a thin coordinator
+    # that assigns feeds to workers and relays their frames/events. Workers own
+    # decode + track/rules/annotate/encode — the CPU-bound work that is the real
+    # bottleneck — and do NOT own the GPU; inference is centralized (above).
+    # Sized to PHYSICAL cores: hyperthread siblings add nothing for this workload.
+    num_workers: int = field(default_factory=lambda: max(1, min(physical_cores(), 8)))
+
+    # Per-process intra-op thread caps, applied at each process's entry point.
+    # With N worker processes on one box each process wants ~1 compute thread; the
+    # library default is for every one of them to size its pool from the whole
+    # machine, which oversubscribes the CPU N-fold and thrashes the scheduler.
+    cv_threads: int = 1
+    torch_threads: int = 1
 
     # Human-readable event label, kept here so wording is not scattered around.
     event_labels: dict = field(
