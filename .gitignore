@@ -24,6 +24,7 @@ models/*.engine
 # ---- Input / uploaded media (large binaries) ----
 input
 uploads/
+tests/
 
 # ---- Generated outputs ----
 output

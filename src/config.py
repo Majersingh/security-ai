@@ -53,7 +53,7 @@ class Config:
     # Process only every Nth frame (1 = every frame). E.g. on a 30 fps video,
     # frame_stride=30 analyses ~1 frame/second: much faster, coarser timing.
     # Time-based thresholds auto-adjust to the effective rate (fps / stride).
-    frame_stride: int = 10
+    frame_stride: int = 1
 
     # ---------------------------------------------------------------- tracker
     # Identity tracking is per-feed (supervision.ByteTrack in FrameProcessor),
