@@ -33,6 +33,7 @@ import logging
 import queue as pyqueue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -205,9 +206,17 @@ class FrameRing:
     def attach(cls, spec: RingSpec) -> "FrameRing":
         return cls(spec, shared_memory.SharedMemory(name=spec.name))
 
-    def acquire(self, timeout: float = 2.0) -> int:
+    # Short on purpose. If the pool is momentarily empty the caller falls back to
+    # carrying the frame inline, which costs a pickle — far cheaper than stalling.
+    # A long wait here would show up as pure inference latency at high feed counts,
+    # for a frame that could have been sent immediately.
+    ACQUIRE_TIMEOUT_S = 0.05
+
+    def acquire(self, timeout: Optional[float] = None) -> int:
         """Claim a free slot index. Raises ``queue.Empty`` if none frees up."""
-        return self.spec.free_q.get(timeout=timeout)
+        return self.spec.free_q.get(
+            timeout=self.ACQUIRE_TIMEOUT_S if timeout is None else timeout
+        )
 
     def release(self, slot: int) -> None:
         try:
@@ -393,6 +402,13 @@ class InferenceClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
+        # Dedicated pool for the submit path (claim slot + memcpy + enqueue). Kept
+        # off the default executor, where the feeds' real-time pacing sleeps live:
+        # a submit queued behind a 33ms sleep shows up as inference latency that
+        # has nothing to do with inference.
+        self._submit_pool = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="infer-submit"
+        )
 
     def start(self) -> "InferenceClient":
         self._loop = asyncio.get_event_loop()
@@ -409,8 +425,9 @@ class InferenceClient:
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
         try:
-            # Claiming a slot and copying the frame both block -> off the loop.
-            await loop.run_in_executor(None, self._submit, req_id, frame)
+            # Claiming a slot and copying the frame both block -> off the loop,
+            # on a pool that no pacing sleep can occupy.
+            await loop.run_in_executor(self._submit_pool, self._submit, req_id, frame)
         except BaseException:
             self._pending.pop(req_id, None)
             raise
@@ -456,6 +473,7 @@ class InferenceClient:
 
     def shutdown(self) -> None:
         self._stop.set()
+        self._submit_pool.shutdown(wait=False)
         self._ring.close()
 
 

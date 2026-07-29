@@ -109,6 +109,14 @@ class Feed:
         # Selective viewing: video is only encoded/sent when this feed is being
         # watched. Detection + events still run regardless.
         self._viewing = False
+        # The source pull gets its OWN thread, because `frames()` does the
+        # real-time pacing `sleep` inside it — on the shared default executor that
+        # sleeping thread competes with latency-critical work (the shared-memory
+        # submit), and with many feeds it can starve the pool outright. These
+        # threads are asleep, not burning CPU, so one per feed is cheap.
+        self._pull_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"pull-{feed_id[:8]}"
+        )
         self._proc: Optional[FrameProcessor] = None
         self._stop = asyncio.Event()
         self._on_update: Optional[UpdateFn] = None
@@ -203,7 +211,7 @@ class Feed:
             last_proc_t = time.monotonic()
             last_emit_t = 0.0           # last time we sent an annotated frame to viewers
             while not self._stop.is_set():
-                item = await loop.run_in_executor(None, _next, gen)
+                item = await loop.run_in_executor(self._pull_pool, _next, gen)
                 decode_accum += getattr(self._source, "last_decode_ms", 0.0)
                 pace_accum += getattr(self._source, "last_wait_ms", 0.0)
                 # >1 when the source strided/dropped frames internally.
@@ -224,11 +232,9 @@ class Feed:
                     and (t_now - last_emit_t >= self._viewer_interval)
                 )
 
-                t_inf = time.monotonic()
-                payload = await self._manager.infer(
+                payload, (detect_ms, post_ms) = await self._manager.infer(
                     self._proc, frame, raw_idx, annotated=want_image
                 )
-                infer_ms = (time.monotonic() - t_inf) * 1000.0
                 events = payload.get("events") or []
                 payload.update({
                     "type": "frame", "feed_id": self.feed_id, "i": raw_idx,
@@ -265,9 +271,9 @@ class Feed:
                 if getattr(self._cfg, "log_timing", False):
                     logger.info(
                         "TIMING %s f=%d | %d pulled | decode=%.0fms pace=%.0fms "
-                        "infer=%.0fms emit=%.0fms | gap=%.0fms (%.1f proc-fps)",
+                        "detect=%.0fms post=%.0fms emit=%.0fms | gap=%.0fms (%.1f proc-fps)",
                         self.feed_id[:8], raw_idx, pulled, decode_accum, pace_accum,
-                        infer_ms, emit_ms, gap_ms, eff_fps,
+                        detect_ms, post_ms, emit_ms, gap_ms, eff_fps,
                     )
                 decode_accum = pace_accum = 0.0
                 pulled = 0
@@ -293,6 +299,7 @@ class Feed:
             })
         finally:
             self._source.close()
+            self._pull_pool.shutdown(wait=False)
             self._manager.remove(self.feed_id)
 
 
@@ -390,23 +397,30 @@ class FeedManager:
 
     async def infer(
         self, proc: FrameProcessor, frame, frame_index: int, annotated: bool = False,
-    ) -> dict:
-        """Process one frame and return a partial result payload.
+    ) -> Tuple[dict, Tuple[float, float]]:
+        """Process one frame; return ``(payload, (detect_ms, post_ms))``.
 
-        Two stages, deliberately split: the shared model detects (this frame is
-        batched with other feeds' frames, wherever the GPU lives), then this
-        feed's own track/rules/annotate runs in a post-processing thread.
+        Two stages, deliberately split and timed separately because they have
+        completely different cures. ``detect_ms`` is the round-trip to the shared
+        model (IPC + queue wait + preprocess + GPU) — cured by imgsz, batch fill,
+        TensorRT. ``post_ms`` is this feed's own track/rules/annotate/encode —
+        cured by not encoding for unwatched feeds. Reporting them as one number
+        hid which of the two was actually costing anything.
 
         ``annotated=False`` -> ``{boxes, events, w, h}`` (upload feeds; the browser
         draws the boxes). ``annotated=True`` -> ``{image, events, w, h}`` with a
         base64 JPEG of the annotated frame (stream feeds; no local video exists).
         """
+        t0 = time.monotonic()
         detections = await self._inferencer.infer(frame)      # awaits the batch
+        t1 = time.monotonic()
         loop = asyncio.get_event_loop()
         fn = self._infer_annotated if annotated else self._infer_boxes
-        return await loop.run_in_executor(
+        payload = await loop.run_in_executor(
             self._post_pool, fn, proc, frame, frame_index, detections
         )
+        t2 = time.monotonic()
+        return payload, ((t1 - t0) * 1000.0, (t2 - t1) * 1000.0)
 
     def shutdown(self) -> None:
         """Release the inference handle and the post-processing pool."""
