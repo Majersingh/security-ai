@@ -27,8 +27,6 @@ Inside a module the pipeline is one responsibility per file:
 
 ```
 app.py          FastAPI: /feeds/* — detection control. Serves NO video.
-rawapp.py       SEPARATE process: raw playback at source frame rate
-rawstream.py    the raw decode/encode loop + ticket store (no model)
 reporting.py    register + heartbeat + durable event spool -> central
 core/
 sources.py      StreamURLSource: PyAV decode of RTSP/HLS/HTTP (NVDEC when available)
@@ -100,7 +98,7 @@ Start an analysis module (standalone — no central needed):
 
 ```bash
 uvicorn module.app:app    --host 0.0.0.0 --port 8001   # detection
-uvicorn module.rawapp:app --host 0.0.0.0 --port 8011   # video (optional)
+uvicorn streamer.app:app  --host 0.0.0.0 --port 8011   # video (optional)
 ```
 
 Or the full fleet — central plus one or more module hosts:
@@ -108,7 +106,7 @@ Or the full fleet — central plus one or more module hosts:
 ```bash
 uvicorn central.app:app   --env-file central/.env --port 9000   # dashboard + registry
 uvicorn module.app:app    --env-file module/.env  --port 8001   # detection
-uvicorn module.rawapp:app --env-file module/.env  --port 8011   # video
+uvicorn streamer.app:app  --env-file streamer/.env --port 8011   # video
 ```
 
 With central, add cameras on **its** dashboard (port 9000) and it places them on a
@@ -179,9 +177,10 @@ owns the GPU** and batches frames from every feed, so there is one CUDA context 
 one copy of the weights; identity tracking stays per-feed. Live streams **drop stale
 frames** when they fall behind real time, and **auto-reconnect**.
 
-The detection service renders nothing. **Video is a separate process** (`rawapp.py`)
-with its own decode at the source frame rate, because display fps was otherwise
-capped by detection fps. The one image detection still produces is the still frame
+The detection service renders nothing. **Video is a separate deployable**
+(`streamer/`) with its own decode at the source frame rate, because display fps was
+otherwise capped by detection fps. Any streamer can serve any camera it can reach, so
+video hosts need no GPU. The one image detection still produces is the still frame
 from `POST /feeds/probe`, used to draw zone/line geometry before a camera starts.
 
 See `docs/ARCHITECTURE.md` for the full design.

@@ -1,0 +1,13 @@
+# Dependencies for the STREAMER — live video playback, one deployable per video host.
+#
+# Deliberately WITHOUT torch, ultralytics or supervision: this service decodes and
+# JPEG-encodes, and never runs a model. That is what makes a video-only host cheap
+# (~150 MB of wheels instead of ~3 GB) and lets it run on a box with no GPU.
+# Enforced by tests/test_streamer_light.py.
+
+av>=12.0                  # PyAV: decode RTSP/HLS/HTTP (libav; no system ffmpeg)
+opencv-python-headless>=4.10.0   # resize + JPEG encode only; headless = no GUI libs
+numpy>=1.26,<2.2          # frame buffers
+
+fastapi>=0.115.0          # /stream/ticket + the video WebSocket
+uvicorn[standard]>=0.30.0 # ASGI server

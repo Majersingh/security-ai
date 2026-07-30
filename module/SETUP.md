@@ -4,12 +4,13 @@ The deployable unit: owns **one GPU**, decodes its assigned camera feeds, detect
 behaviour, and reports events to central. Deploy one per GPU host; that is how the
 system scales.
 
-Two processes, deliberately separate:
+Two processes, deliberately separate — and the second is its own deployable
+(`streamer/`, with its own requirements and env; see `streamer/SETUP.md`):
 
 | Process | Port | Does | Serves video? |
 |---|---|---|---|
 | `module.app:app` | 8001 | detection, tracking, rules, events | **no** |
-| `module.rawapp:app` | 8011 | raw playback at source frame rate | yes, only this |
+| `streamer.app:app` | 8011 | video at source frame rate (own deployable) | yes, only this |
 
 Display fps used to be capped by *detection* fps, which made smooth video impossible
 without spending the whole GPU on a few cameras. Splitting them fixed that: the
@@ -49,7 +50,7 @@ cp module/.env.example module/.env      # then edit
 | `MODULE_TOKEN` | Must match `CENTRAL_TOKEN` on central. |
 | `MODULE_ID` | Stable per host. Unset = random id, so a restart looks like a new module to central. |
 | `MODULE_PUBLIC_URL` | Where central reaches this box (port 8001). |
-| `RAW_PUBLIC_URL` | Where **browsers** reach the raw video service (port 8011). Blank = this host serves no video and cameras show `playable: false`. Not `127.0.0.1` unless the browser is on this machine. |
+| `HOST_ID` | Identifies this **machine**. Set the same value in `streamer/.env` so central prefers the co-located streamer for these cameras. |
 
 **2. `module/core/config.py` — pipeline tuning**
 
@@ -74,11 +75,12 @@ order of impact:
 
 ```bash
 uvicorn module.app:app    --env-file module/.env --host 0.0.0.0 --port 8001   # detection
-uvicorn module.rawapp:app --env-file module/.env --host 0.0.0.0 --port 8011   # video
+uvicorn streamer.app:app  --env-file streamer/.env --host 0.0.0.0 --port 8011  # video
 ```
 
-The raw service is optional: skip it and detection works exactly the same, cameras
-just aren't playable. `GET :8011/health` shows `active_streams` / `max_streams`.
+The streamer is a separate deployable and entirely optional: skip it and detection
+works the same, cameras just aren't playable. It can also run on a different host —
+see `streamer/SETUP.md`. `GET :8011/health` shows `active_streams` / `max_streams`.
 
 Healthy startup looks like:
 
@@ -113,10 +115,10 @@ CENTRAL_URL=https://central.yourorg.internal \
 MODULE_TOKEN=<secret> \
 MODULE_ID=gpu-host-2 \
 MODULE_PUBLIC_URL=http://10.0.1.23:8001 \
-RAW_PUBLIC_URL=http://10.0.1.23:8011 \
+HOST_ID=gpu-host-2 \
 uvicorn module.app:app --host 0.0.0.0 --port 8001
-# plus, alongside it:
-uvicorn module.rawapp:app --host 0.0.0.0 --port 8011
+# video, if you want it on this host (see streamer/SETUP.md):
+uvicorn streamer.app:app --env-file streamer/.env --host 0.0.0.0 --port 8011
 ```
 
 Two GPUs in one chassis? Run two instances, each seeing only its own card, and
@@ -179,7 +181,7 @@ python tests/test_ring.py         # shared-memory frame transport
 python tests/test_e2e.py          # coordinator + 2 workers + inference process
 python tests/test_wired.py        # this module registering with a live central
 python tests/test_batch_wait.py   # batch-window latency
-python tests/test_rawstream.py    # raw playback: source rate, tickets, stream cap
+python tests/test_streamer.py     # streamer: source rate, tickets, stream cap
 python tests/test_preview.py      # probe + add-with-geometry
 python tests/bench_gpu.py         # measure fps_budget on this GPU
 ```

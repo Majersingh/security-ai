@@ -74,7 +74,7 @@ async function wsUrlFor(cam){
   // Central asks the module's raw-video service for a short-lived ticket. The RTSP
   // URL (and any credentials in it) never reaches the browser.
   try {
-    const r = await fetch(`/api/cameras/${cam.id}/raw`, {
+    const r = await fetch(`/api/cameras/${cam.id}/stream`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({width: 960})}).then(r=>r.json());
     return r.ws_url || null;
@@ -134,22 +134,22 @@ function paintNotice(){
   const box = $('notice');
   const placed  = cams.filter(c => c.module_id);
   const noRaw   = placed.filter(c => !c.playable &&
-                    (c.playable_reason || '').includes('raw video service'));
+                    (c.playable_reason || '').includes('streamer'));
   if (placed.length && noRaw.length === placed.length){
     // Every placed camera is blocked for the same reason: nothing is serving video.
     box.style.display = '';
-    box.innerHTML = `<b>No raw video service is running.</b> Detection is unaffected —
+    box.innerHTML = `<b>No streamer is running.</b> Detection is unaffected —
       it just cannot play video. Start it on the module host, alongside the detection
       service:<br>
       <code style="display:inline-block;margin:6px 0;padding:4px 8px;background:#11131a;
-        border-radius:4px">uvicorn module.rawapp:app --host 0.0.0.0 --port 8011</code><br>
-      then set <code>RAW_PUBLIC_URL</code> in <code>module/.env</code> to where your
+        border-radius:4px">uvicorn module.streamer:app --host 0.0.0.0 --port 8011</code><br>
+      then set <code>STREAMER_PUBLIC_URL</code> in <code>module/.env</code> to where your
       browser reaches it (port 8011) and restart the detection service so it
       re-registers.`;
   } else if (noRaw.length){
     box.style.display = '';
     box.innerHTML = `<b>${noRaw.length} camera(s) cannot play video:</b> their module
-      is not running the raw video service. Others are fine.`;
+      is not running the streamer. Others are fine.`;
   } else {
     box.style.display = 'none';
   }

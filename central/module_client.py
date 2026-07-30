@@ -81,22 +81,22 @@ class ModuleClient:
     async def feeds(self) -> Dict[str, Any]:
         return await self._call("/feeds")
 
-    async def raw_ticket(self, url: str) -> Dict[str, Any]:
+    async def stream_ticket(self, url: str) -> Dict[str, Any]:
         """Swap a stream URL for a short-lived ticket the browser can use.
 
         The browser must never receive the RTSP URL itself — credentials in a
         WebSocket query string end up in history and access logs.
         """
-        return await self._call("/stream/raw/ticket", "POST", {"url": url})
+        return await self._call("/stream/ticket", "POST", {"url": url})
 
-    def raw_ws_url(self, ticket: str, fps: int = 0, width: int = 0) -> str:
+    def stream_ws_url(self, ticket: str, fps: int = 0, width: int = 0) -> str:
         ws = self.base.replace("https://", "wss://").replace("http://", "ws://")
         q = f"?ticket={ticket}"
         if fps:
             q += f"&fps={fps}"
         if width:
             q += f"&width={width}"
-        return f"{ws}/stream/raw{q}"
+        return f"{ws}/stream{q}"
 
     async def probe(self, url: str) -> Dict[str, Any]:
         """One still frame + true source dimensions, without creating a feed.

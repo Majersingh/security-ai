@@ -19,6 +19,7 @@ until then, additive ALTERs would be ceremony for data nobody keeps.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -26,11 +27,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger("central")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS modules (
     id            TEXT PRIMARY KEY,
-    url           TEXT NOT NULL,          -- how central and browsers reach it
-    raw_url       TEXT,                   -- separate raw-video service, if any
+    url           TEXT NOT NULL,          -- how central/browsers reach this host
+    role          TEXT NOT NULL DEFAULT 'detection',   -- detection | streamer
+    host          TEXT,                   -- groups co-located services on one machine
     gpu           TEXT,
     max_feeds     INTEGER NOT NULL DEFAULT 0,
     fps_budget    REAL    NOT NULL DEFAULT 0,   -- measured aggregate detect fps
@@ -82,7 +86,41 @@ class Store:
         self._db.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self._db.executescript(SCHEMA)
+            self._ensure_schema()
             self._db.commit()
+
+    def _ensure_schema(self) -> None:
+        """Recreate any table whose columns no longer match SCHEMA.
+
+        `CREATE TABLE IF NOT EXISTS` silently leaves an existing table alone, so a
+        schema change would otherwise surface as `no column named X` on the first
+        insert — at runtime, as a 500, long after startup. Since the data here is
+        deliberately disposable (no migrations), the honest response is to rebuild
+        the table and say so loudly.
+
+        The expected columns are read from SCHEMA itself via a scratch in-memory
+        database, so this stays correct without a version number to remember to bump.
+        """
+        ref = sqlite3.connect(":memory:")
+        try:
+            ref.executescript(SCHEMA)
+            tables = [r[0] for r in ref.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")]
+            for table in tables:
+                want = {r[1] for r in ref.execute(f"PRAGMA table_info({table})")}
+                have = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+                if not have or have == want:
+                    continue
+                logger.warning(
+                    "Table '%s' is out of date (missing %s, extra %s) — recreating it. "
+                    "Central's data is disposable: cameras must be re-added and "
+                    "modules re-register themselves.",
+                    table, sorted(want - have) or "nothing", sorted(have - want) or "nothing",
+                )
+                self._db.execute(f"DROP TABLE {table}")
+            self._db.executescript(SCHEMA)      # rebuild whatever was dropped
+        finally:
+            ref.close()
 
     def close(self) -> None:
         with self._lock:
@@ -93,16 +131,18 @@ class Store:
         now = time.time()
         with self._lock:
             self._db.execute(
-                """INSERT INTO modules (id, url, raw_url, gpu, max_feeds, fps_budget,
-                                        version, registered_at, last_seen, active_feeds)
-                   VALUES (?,?,?,?,?,?,?,?,?,0)
+                """INSERT INTO modules (id, url, role, host, gpu, max_feeds,
+                                        fps_budget, version, registered_at,
+                                        last_seen, active_feeds)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,0)
                    ON CONFLICT(id) DO UPDATE SET
-                     url=excluded.url, raw_url=excluded.raw_url, gpu=excluded.gpu,
-                     max_feeds=excluded.max_feeds, fps_budget=excluded.fps_budget,
-                     version=excluded.version, last_seen=excluded.last_seen""",
-                (mod["id"], mod["url"], mod.get("raw_url") or None, mod.get("gpu"),
-                 int(mod.get("max_feeds", 0)), float(mod.get("fps_budget", 0)),
-                 mod.get("version"), now, now),
+                     url=excluded.url, role=excluded.role, host=excluded.host,
+                     gpu=excluded.gpu, max_feeds=excluded.max_feeds,
+                     fps_budget=excluded.fps_budget, version=excluded.version,
+                     last_seen=excluded.last_seen""",
+                (mod["id"], mod["url"], mod.get("role") or "detection",
+                 mod.get("host"), mod.get("gpu"), int(mod.get("max_feeds", 0)),
+                 float(mod.get("fps_budget", 0)), mod.get("version"), now, now),
             )
             self._db.commit()
 

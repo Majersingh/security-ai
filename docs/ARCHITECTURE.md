@@ -12,9 +12,9 @@ behind every boundary below:
 | Registry, placement, events, UI | nothing heavy | `central/` | one instance |
 | Decode, tracking, rules, snapshots | CPU | `module/app.py` + workers | worker processes |
 | Detection | GPU | one inference process | batch depth |
-| Video playback | CPU, latency-sensitive | `module/rawapp.py` | its own process |
+| Video playback | CPU, latency-sensitive | `streamer/` | streamer hosts (no GPU) |
 
-Setup: `central/SETUP.md`, `module/SETUP.md`.
+Setup: `central/SETUP.md`, `module/SETUP.md`, `streamer/SETUP.md`.
 
 ---
 
@@ -24,16 +24,24 @@ Per GPU host:
 
 ```
 central (elsewhere, one per fleet) ── no GPU, no torch
-   │  assign / stop / geometry / raw ticket        ▲ register / heartbeat / events
+   │  assign / stop / geometry / stream ticket     ▲ register / heartbeat / events
    ▼                                              │
 module/app.py  :8001   DETECTION — serves no video
    ├── N worker processes   decode → track → rules → snapshots
    └── 1 inference process  the only thing touching the GPU
-module/rawapp.py :8011  RAW VIDEO — no model, own decode, source frame rate
+streamer/app.py  :8011  VIDEO — no model, own decode, source frame rate
    └── browser connects here directly for tiles
-```
 
-Five process types. That is the current operational weak point — see §7.
+Deployables: `central/` · `module/` · `streamer/`, plus a shared `core/` package
+(the stream decoder and the process helpers — the only code two of them share).
+
+The streamer **registers itself**, so it does not need the detection module running:
+a video-only host installs `streamer/requirements.txt` (no torch, ~150 MB) and needs
+no GPU. `HOST_ID` pairs a streamer with the detection module on the same machine, so
+central prefers a co-located streamer — it provably reaches that host's cameras.
+
+Five process types on a combined host. That is the current operational weak point —
+see §7.
 
 **Scaling = deploy another module host.** It registers itself, central sees the
 headroom and places cameras on it. Nothing on central is edited.
@@ -59,6 +67,10 @@ RSS per camera, plus a model load per camera added. Containerise by **role**.
 - Central: any small VM. No GPU, and `central/requirements.txt` shares nothing with
   the module's — enforced by `tests/test_central_light.py`, which imports central
   with torch/cv2/numpy blocked.
+- Streamer hosts: **no GPU needed.** `streamer/requirements.txt` is five packages
+  (av, opencv-headless, numpy, fastapi, uvicorn), enforced by
+  `tests/test_streamer_light.py`. This is what lets video scale independently of
+  detection — video load follows *viewers*, detection follows *cameras*.
 - Concurrency per host is bounded by **CPU** (decode, tracking, snapshots, plus one
   extra decode per watched tile) and by **GPU detection throughput** — not VRAM. One
   `yolo11n.pt` is 5.6 MB and a single shared model serves every feed.
@@ -82,7 +94,7 @@ The pipeline can only show a viewer frames it detected on, so display was capped
 detection rate — and `frame_stride` discarded intermediate frames before they were
 even converted to BGR. Smooth video was impossible without spending the whole GPU on
 a handful of cameras.
-→ **Playback is a separate process with its own decode** (`module/rawapp.py`), at the
+→ **Playback is a separate deployable with its own decode** (`streamer/`), at the
 source frame rate. The detection service produces no video at all; its only image is
 the still frame for geometry drawing.
 
@@ -161,10 +173,16 @@ pacing, and on a shared pool that sleeping thread starves latency-critical work.
   preprocessed shape. It matters because the first frame of an unwarmed shape stalls
   the *shared* process — every feed, not just the new camera.
 
-### 4.5 Raw video service (`rawapp.py`, `rawstream.py`)
-Its own process on its own port. No model, no `FeedManager`, no worker processes, no
-shared event loop. Plays at the source frame rate — measured **28.0 fps from a
-28.79 fps source**.
+### 4.5 Streamer (`streamer/app.py`, `streamer/videostream.py`)
+Its own deployable, process and port. No model, no `FeedManager`, no worker
+processes, no shared event loop, and — enforced by `tests/test_streamer_light.py` —
+no torch. Plays at the source frame rate: measured **28.0 fps from a 28.79 fps
+source**. It has its own env-driven `StreamerConfig` rather than the module's, and
+registers itself with central under `role: "streamer"`, `max_feeds: 0`.
+
+**Any streamer can serve any camera it can reach**, including one detected on a
+different host — which is what makes a video-only host possible. Central prefers a
+streamer sharing the camera's `HOST_ID`, then falls back to the rest.
 
 Its own process rather than routes on the detection app because pushing frames at
 source rate means ~28 `send_json` calls per second *per tile*; on the detection app
@@ -173,8 +191,10 @@ that is the same event loop relaying results from the worker processes.
 - **Tickets, not URLs.** Browsers connect with a short-lived ticket. An
   `rtsp://user:pass@host` in a WebSocket query string would land in browser history
   and access logs.
-- **`raw_max_streams`** caps concurrent decodes so a video wall's "all" button cannot
-  swamp the box.
+- **`STREAMER_MAX_STREAMS`** caps concurrent decodes so a video wall's "all" button
+  cannot swamp the box.
+- Central never places cameras on a streamer, and pinning one is rejected — it has
+  `max_feeds: 0` and is excluded from the capacity table so it cannot skew headroom.
 - Cost: one extra decode per *watched* camera. That is the deliberate trade — decode
   is cheap next to a GPU pass, and it stops only when the tile closes.
 
@@ -233,16 +253,17 @@ it and `frame_stride` are the two dials that set the ceiling.
 
 | Endpoint | When | Carries |
 |---|---|---|
-| `POST /api/modules/register` | startup | id, public URL, **raw_url**, GPU, `max_feeds`, `fps_budget` |
+| `POST /api/modules/register` | startup | id, public URL, **role** (`detection`/`streamer`), **host**, GPU, `max_feeds`, `fps_budget` |
 | `POST /api/modules/{id}/heartbeat` | ~10 s | active feeds, per-camera status |
 | `POST /api/events` | on violation | batched events, spooled and retried |
 
 **Central → module** — `POST /feeds/stream` (with central's `camera_id` so events come
 back attributable), `/feeds/{id}/stop`, `/feeds/{id}/geometry`, `/feeds/probe`,
-`GET /feeds`; and `POST /stream/raw/ticket` on the **raw** service.
+`GET /feeds`; and `POST /stream/ticket` on a **streamer**.
 
-**Browser → module raw service, directly** — `WS /stream/raw?ticket=…`. Central hands
-out the URL and nothing more; frames never traverse central.
+**Browser → a streamer, directly** — `WS /stream?ticket=…`, obtained from
+`POST /api/cameras/{id}/stream`. Central hands out the URL and nothing more; frames
+never traverse central, and the RTSP URL never reaches the browser.
 
 Events are wired in at the module's existing global events channel, so no CV code
 knows central exists.
@@ -257,8 +278,10 @@ offline the camera stays unplaced with status `waiting for pinned module`. Peopl
 for reasons central cannot see — usually that this host has the network route — so
 relocating it would break the camera with nothing explaining why.
 
-**Central's database is disposable.** There are deliberately no migrations: a schema
-change means deleting the file. Cameras are re-added, modules re-register. This stops
+**Central's database is disposable.** There are deliberately no migrations. On
+startup `Store._ensure_schema()` compares each table against `SCHEMA` (read from a
+scratch in-memory DB, so there is no version to bump) and **rebuilds any that
+drifted**, warning loudly. Cameras are re-added and hosts re-register. This stops
 being acceptable once event history has to survive an upgrade.
 
 ---
@@ -276,9 +299,11 @@ being acceptable once event history has to survive an upgrade.
   respond in sequence, so while the GPU computes batch K nothing prepares K+1. GPU
   utilisation cannot reach 100% regardless of `infer_threads`. Fixing it means
   double-buffering, or TensorRT/ONNX to move preprocessing onto the GPU.
-- **Raw playback decodes each watched camera a second time.** Fine for a few tiles;
-  `raw_max_streams` (16) is what stops a wall's "all" from swamping the host — but it
-  also means "all" silently shows only the first 16.
+- **Streaming decodes each watched camera a second time.** Fine for a few tiles;
+  `STREAMER_MAX_STREAMS` (16) is what stops a wall's "all" from swamping the host —
+  but it also means "all" silently shows only the first 16. A streamer host also
+  needs its own network route to the cameras, and each adds one more concurrent
+  connection to them, which some IP cameras cap.
 - **`supervision.ByteTrack` is deprecated** (removed in 0.30) and per-feed identity
   depends on it. `requirements.txt` pins `<0.30` for exactly this reason.
 - **Shared memory is allocated up front** — `infer_slots × h × w × 3` ≈ 400 MB. A

@@ -90,10 +90,10 @@ async function toggleView(camId, name){
   // Ask central for a raw-playback URL; the detection module serves no video.
   let wsUrl = null;
   try {
-    const r = await j(`/api/cameras/${camId}/raw`, {method:'POST',
+    const r = await j(`/api/cameras/${camId}/stream`, {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({width:960})});
     wsUrl = r.ws_url;
-    if (!wsUrl) { alert(r.error || 'no raw video service on that module'); return; }
+    if (!wsUrl) { alert(r.error || 'no streamer on that module'); return; }
   } catch(e){ alert('could not start video'); return; }
   const box = document.createElement('div');
   box.className = 'tile'; box.id = 'tile-'+camId;
@@ -176,8 +176,8 @@ async function refresh(){
         ? `<button class="ghost act-view" data-id="${esc(c.id)}" data-name="${esc(c.name)}"
             >${tiles[c.id]?'stop':'view'}</button>`
         : `<span class="dim" title="${esc(c.playable_reason||'')}">${
-             (c.playable_reason||'').includes('raw video service')
-               ? 'video service off' : '—'}</span>`],
+             (c.playable_reason||'').includes('streamer')
+               ? 'no streamer' : '—'}</span>`],
       ['',c=>`<button class="act-del" data-id="${esc(c.id)}">remove</button>`]],
      cams.cameras);
   tbl(document.getElementById('evs'),

@@ -1,4 +1,4 @@
-"""Raw video streaming — completely independent of detection.
+"""Video streaming engine — completely independent of detection.
 
 Why this exists: the analysis path can only show a viewer frames it ran detection
 on, so display fps was capped by detection fps (and by `frame_stride`, which
@@ -65,7 +65,7 @@ def active_streams() -> int:
     return _active
 
 
-async def stream_raw(websocket, url: str, cfg, target_fps: float = 0.0,
+async def stream_video(websocket, url: str, cfg, target_fps: float = 0.0,
                      max_width: int = 0) -> None:
     """Decode `url` and push JPEG frames down an already-accepted WebSocket.
 
@@ -74,24 +74,24 @@ async def stream_raw(websocket, url: str, cfg, target_fps: float = 0.0,
     """
     global _active
 
-    limit = int(getattr(cfg, "raw_max_streams", 16))
+    limit = int(getattr(cfg, "streamer_max_streams", 16))
     if _active >= limit:
         await websocket.send_json({
             "type": "error",
-            "message": f"raw stream limit reached ({limit}) — close a tile first",
+            "message": f"stream limit reached ({limit}) — close a tile first",
         })
         return
 
     loop = asyncio.get_event_loop()
-    width_cap = int(max_width or getattr(cfg, "raw_max_width", 960))
-    quality = int(getattr(cfg, "raw_jpeg_quality", 55))
+    width_cap = int(max_width or getattr(cfg, "streamer_max_width", 960))
+    quality = int(getattr(cfg, "streamer_jpeg_quality", 55))
 
     try:
         source = await loop.run_in_executor(
             None,
             lambda: StreamURLSource(
                 url,
-                # Raw playback wants EVERY frame: no stride, and drop-when-behind so
+                # Playback wants EVERY frame: no stride, and drop-when-behind so
                 # a slow viewer stays near live instead of drifting into slow motion.
                 stride=1,
                 max_lag_s=getattr(cfg, "stream_max_lag_seconds", 0.5),
@@ -135,11 +135,11 @@ async def stream_raw(websocket, url: str, cfg, target_fps: float = 0.0,
             await websocket.send_json({"type": "frame", "image": payload})
             sent += 1
     except Exception:  # noqa: BLE001 - client vanished, or decode blew up
-        logger.debug("raw stream ended", exc_info=True)
+        logger.debug("stream ended", exc_info=True)
     finally:
         _active -= 1
         await loop.run_in_executor(None, source.close)
-        logger.info("Raw stream closed after %d frame(s): %s", sent, url)
+        logger.info("Stream closed after %d frame(s): %s", sent, url)
 
 
 def _next_frame(gen):

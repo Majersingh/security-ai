@@ -99,18 +99,19 @@ start landing on it. Nothing here is edited and central is not restarted.
 | `GET/POST /api/cameras`, `DELETE /api/cameras/{id}` | camera registry |
 | `POST /api/cameras/{id}/geometry` | zone/line, persisted and pushed live to the module |
 | `POST /api/cameras/probe` | one still frame, to draw geometry before adding |
-| `POST /api/cameras/{id}/raw` | short-lived WebSocket URL for live video |
+| `POST /api/cameras/{id}/stream` | short-lived WebSocket URL for live video |
 | `GET /api/events?limit=&camera_id=` | violation history |
 | `POST /api/modules/register`, `/api/modules/{id}/heartbeat`, `/api/events` | the module contract (token-checked) |
 
 ## Things to know
 
 **Video never passes through central, and the detection module serves none.**
-Playback is a separate process per host (`module/rawapp.py`) that decodes
+Playback is a separate deployable (`streamer/`) that decodes
 independently at the source frame rate — display used to be capped by *detection*
 fps, which made smooth video impossible. `POST /api/cameras/{id}/raw` returns a
-short-lived WebSocket URL on that service; the browser connects to it directly.
-Cameras show `playable: true` only when their module advertises the raw service.
+short-lived WebSocket URL on a streamer; the browser connects to it directly.
+Cameras show `playable: true` when **any** streamer is online — it need not be on the
+host detecting them, which is what allows GPU-less video hosts.
 
 **Cameras are sticky to a module.** Track identities and the violation debounce
 state machine are sequential per feed, so a camera cannot be moved mid-stream

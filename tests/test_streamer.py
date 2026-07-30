@@ -1,4 +1,4 @@
-"""Raw video path: independent of detection, and actually smooth.
+"""Streamer path: independent of detection, and actually smooth.
 
   1. a ticket hides the stream URL from the browser
   2. an unknown/expired ticket is refused
@@ -14,11 +14,11 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "module"))
-sys.path.insert(0, str(ROOT / "module" / "core"))
+sys.path.insert(0, str(ROOT / "core"))
+sys.path.insert(0, str(ROOT / "streamer"))
 
-from config import Config
-from utils import limit_process_threads, setup_logging
+from config import StreamerConfig
+from procutil import limit_process_threads, setup_logging
 
 setup_logging("ERROR")
 limit_process_threads(1, 1)
@@ -27,7 +27,7 @@ VIDEO = str(ROOT / "module" / "input" / "operator.mp4")
 
 
 class FakeWS:
-    """Collects what stream_raw would send, and can cut the connection."""
+    """Collects what stream_video would send, and can cut the connection."""
 
     def __init__(self, stop_after=None):
         self.msgs = []
@@ -50,28 +50,28 @@ class FakeWS:
 
 
 async def main() -> int:
-    import rawstream
+    import videostream
 
-    cfg = Config()
+    cfg = StreamerConfig()
     ok = True
 
     # 1. ticket hides the URL
     secret = "rtsp://admin:s3cret@10.0.0.5/stream1"
-    ticket, ttl = rawstream.issue_ticket(secret)
-    hidden = secret not in ticket and rawstream.resolve_ticket(ticket) == secret
+    ticket, ttl = videostream.issue_ticket(secret)
+    hidden = secret not in ticket and videostream.resolve_ticket(ticket) == secret
     print(f"  1. ticket hides the stream URL ............ {'PASS' if hidden else 'FAIL'}"
           f"  (ticket={ticket[:10]}…, ttl={ttl:.0f}s)")
     ok &= hidden
 
     # 2. bad ticket refused
-    bad = rawstream.resolve_ticket("deadbeef") is None
+    bad = videostream.resolve_ticket("deadbeef") is None
     print(f"  2. unknown ticket refused ................. {'PASS' if bad else 'FAIL'}")
     ok &= bad
 
     # 3 + 4. plays at source rate, with NO feed anywhere
     ws = FakeWS(stop_after=40)
     t0 = time.perf_counter()
-    await rawstream.stream_raw(ws, VIDEO, cfg, target_fps=0, max_width=640)
+    await videostream.stream_video(ws, VIDEO, cfg, target_fps=0, max_width=640)
     dt = time.perf_counter() - t0
     meta, frames = ws.meta(), ws.frames()
     src_fps = (meta or {}).get("fps") or 0
@@ -88,8 +88,8 @@ async def main() -> int:
     ok &= smooth and jpeg_ok
 
     # 5. concurrency cap
-    cfg2 = Config()
-    cfg2.raw_max_streams = 1
+    cfg2 = StreamerConfig()
+    cfg2.streamer_max_streams = 1
     held = asyncio.Event()
 
     class Blocker(FakeWS):
@@ -99,10 +99,10 @@ async def main() -> int:
                 held.set()
                 await asyncio.sleep(3)      # hold the slot open
 
-    a = asyncio.create_task(rawstream.stream_raw(Blocker(), VIDEO, cfg2))
+    a = asyncio.create_task(videostream.stream_video(Blocker(), VIDEO, cfg2))
     await asyncio.wait_for(held.wait(), timeout=60)
     b = FakeWS()
-    await rawstream.stream_raw(b, VIDEO, cfg2)
+    await videostream.stream_video(b, VIDEO, cfg2)
     err = b.error()
     capped = err is not None and "limit" in (err.get("message") or "")
     print(f"  5. concurrency cap enforced ............... {'PASS' if capped else 'FAIL'}"

@@ -59,6 +59,8 @@ def choose_module(modules: List[Dict[str, Any]], cameras: List[Dict[str, Any]],
     for m in modules:
         if not m.get("online"):
             continue
+        if m.get("role") == "streamer":
+            continue          # video-only host: serves tiles, never runs detection
         load = module_load(m, cameras, frame_stride)
         if load["slots_free"] <= 0:
             continue
@@ -77,7 +79,8 @@ def choose_module(modules: List[Dict[str, Any]], cameras: List[Dict[str, Any]],
 
 def fleet_summary(modules: List[Dict[str, Any]], cameras: List[Dict[str, Any]],
                   frame_stride: int) -> Dict[str, Any]:
-    loads = [module_load(m, cameras, frame_stride) for m in modules]
+    loads = [module_load(m, cameras, frame_stride) for m in modules
+             if m.get("role") != "streamer"]
     online = [l for l in loads if l["online"]]
     return {
         "modules_total": len(loads),

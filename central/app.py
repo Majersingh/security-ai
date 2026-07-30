@@ -205,9 +205,10 @@ async def probe_camera(payload: dict) -> JSONResponse:
     return JSONResponse({"error": f"could not preview stream: {last}"}, status_code=502)
 
 
-@app.post("/api/cameras/{cam_id}/raw")
-async def camera_raw_url(cam_id: str, payload: Optional[dict] = None) -> JSONResponse:
-    """WebSocket URL for RAW video of this camera — independent of detection.
+@app.post("/api/cameras/{cam_id}/stream")
+async def camera_stream_url(cam_id: str,
+                            payload: Optional[dict] = None) -> JSONResponse:
+    """WebSocket URL for live video of this camera — independent of detection.
 
     Smooth playback at the source frame rate, because it does not wait on the
     model. Costs one extra decode on the module while a viewer is watching, which
@@ -221,39 +222,48 @@ async def camera_raw_url(cam_id: str, payload: Optional[dict] = None) -> JSONRes
     if cam is None:
         raise HTTPException(404, "unknown camera")
 
-    # Prefer the module already running this camera (it has a proven route to it);
-    # otherwise any online module can decode it.
-    mods = store.modules(STALE_AFTER)
-    owner = next((m for m in mods if m["id"] == cam.get("module_id") and m["online"]),
-                 None)
-    candidates = [owner] if owner else [m for m in mods if m["online"]]
-    if not candidates:
-        return JSONResponse({"error": "no module is online to play this stream"},
-                            status_code=503)
+    # ANY streamer can play ANY camera it can reach: streaming shares nothing with
+    # detection — own decode, no feed, no model — so the host serving video need not
+    # be the one analysing the camera.
+    #
+    # Order matters. A streamer on the SAME machine as the detecting module provably
+    # has a route to this camera (that machine is decoding it right now), so prefer
+    # it. Others are still worth trying: they may sit on another network and fail, but
+    # one of them may be the only streamer running at all.
+    all_mods = store.modules(STALE_AFTER)
+    streamers = [m for m in all_mods if m["online"] and m.get("role") == "streamer"]
+    if not streamers:
+        return JSONResponse(
+            {"error": "no streamer is running — start one with "
+                      "`uvicorn module.streamer:app --port 8011` and set "
+                      "STREAMER_PUBLIC_URL"},
+            status_code=503,
+        )
+    owner = next((m for m in all_mods if m["id"] == cam.get("module_id")), None)
+    owner_host = (owner or {}).get("host")
+    candidates = ([m for m in streamers if owner_host and m.get("host") == owner_host] +
+                  [m for m in streamers if not (owner_host and m.get("host") == owner_host)])
 
     body = payload or {}
     fps = int(body.get("fps") or 0)
     width = int(body.get("width") or 0)
     last = ""
     for mod in candidates:
-        # Raw video is served by a SEPARATE process on the host, advertised at
-        # registration. Without it this host offers analysed video only.
-        raw_base = mod.get("raw_url")
-        if not raw_base:
-            last = f"module '{mod['id']}' advertises no raw video service"
-            continue
         try:
-            client = ModuleClient(raw_base)
-            res = await client.raw_ticket(cam["url"])
+            client = ModuleClient(mod["url"])
+            res = await client.stream_ticket(cam["url"])
             return JSONResponse({
-                "ws_url": client.raw_ws_url(res["ticket"], fps, width),
-                "module_id": mod["id"], "expires_in": res.get("expires_in"),
+                "ws_url": client.stream_ws_url(res["ticket"], fps, width),
+                # Which host is decoding for this tile — not necessarily the one
+                # detecting the camera.
+                "served_by": mod["id"],
+                "detected_by": cam.get("module_id"),
+                "expires_in": res.get("expires_in"),
             })
         except (ModuleError, KeyError) as exc:
             last = str(exc)
-            logger.warning("raw ticket via %s failed: %s", mod["id"], exc)
-    return JSONResponse({"error": f"could not start raw stream: {last}"},
-                        status_code=502)
+            logger.warning("stream ticket via %s failed: %s", mod["id"], exc)
+    return JSONResponse({"error": f"could not start video: {last}"}, status_code=502)
 
 
 @app.post("/api/cameras")
@@ -266,8 +276,13 @@ async def add_camera(payload: dict) -> dict:
     geometry = payload.get("geometry")
     # Optional: pin this camera to a specific module instead of auto-placing.
     pinned = (payload.get("module_id") or "").strip() or None
-    if pinned and app.state.store.module(pinned) is None:
-        raise HTTPException(400, f"unknown module '{pinned}'")
+    if pinned:
+        target = app.state.store.module(pinned)
+        if target is None:
+            raise HTTPException(400, f"unknown module '{pinned}'")
+        if target.get("role") == "streamer":
+            raise HTTPException(
+                400, f"'{pinned}' is a streamer (video only) and cannot run detection")
 
     cam_id = app.state.store.add_camera(name, url, geometry, pinned_module=pinned)
     placed = await _try_place(app, cam_id)
@@ -283,7 +298,10 @@ async def list_cameras() -> dict:
     WebSocket on the module host's separate raw-video service.
     """
     store: Store = app.state.store
-    mods = {m["id"]: m for m in store.modules(STALE_AFTER)}
+    all_mods = store.modules(STALE_AFTER)
+    mods = {m["id"]: m for m in all_mods}
+    any_streamer = any(m["online"] and m.get("role") == "streamer"
+                       for m in all_mods)
     out = []
     for cam in store.cameras():
         row = dict(cam)
@@ -292,18 +310,19 @@ async def list_cameras() -> dict:
         # Can this camera be played, and if not, WHY? The reason is surfaced in the
         # UI: "not playable" with no explanation sends people hunting through logs
         # for a missing RAW_PUBLIC_URL.
-        if mod is None:
+        # Playable if ANY online host runs the raw service — it does not have to be
+        # the module detecting this camera, because raw playback is independent.
+        if any_streamer:
+            row["playable"], row["playable_reason"] = True, None
+        elif mod is None:
             row["playable"], row["playable_reason"] = False, "not placed on a module yet"
-        elif not mod["online"]:
-            row["playable"], row["playable_reason"] = False, f"module '{mod['id']}' is offline"
-        elif not mod.get("raw_url"):
+        else:
             row["playable"] = False
             row["playable_reason"] = (
-                f"raw video service not running on '{mod['id']}' — start it with "
-                f"`uvicorn module.rawapp:app --port 8011` and set RAW_PUBLIC_URL"
+                "no streamer is running — start one with "
+                "`uvicorn module.streamer:app --port 8011` and set "
+                "STREAMER_PUBLIC_URL"
             )
-        else:
-            row["playable"], row["playable_reason"] = True, None
         out.append(row)
     return {"cameras": out}
 

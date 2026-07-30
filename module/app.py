@@ -30,7 +30,8 @@ from pathlib import Path
 # directory too, so sibling modules like `reporting` resolve when the app is loaded
 # as `module.app:app` — in that case only the repo root is on sys.path, not here.
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "core"))
+sys.path.insert(0, str(ROOT.parent / "core"))   # shared: sources, procutil
+sys.path.insert(0, str(ROOT / "core"))          # detection-only CV modules
 sys.path.insert(0, str(ROOT))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402

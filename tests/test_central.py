@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "module"))          # reporting.py
+sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(ROOT / "module" / "core"))  # config, utils, ...
 
 CENTRAL = "http://127.0.0.1:9411"
@@ -135,11 +136,12 @@ def main() -> int:
     cam1 = r["camera_id"]
     cams = get("/api/cameras")["cameras"]
     placed = cams[0]["module_id"] == "mod-a" and cams[0]["status"] == "running"
-    # Stub module advertises no raw_url, so it must be unplayable AND say why in a
+    # No streamer is registered, so the camera must be unplayable AND say why in a
     # way a user can act on — this string is shown in the dashboard and the wall.
     has_video = cams[0]["playable"] is False
     reason = cams[0].get("playable_reason") or ""
-    has_video = has_video and "raw video service" in reason and "rawapp" in reason
+    has_video = (has_video and "streamer" in reason
+                 and "module.streamer" in reason and "STREAMER_PUBLIC_URL" in reason)
     print(f"  2. camera placed on module ................ {'PASS' if placed else 'FAIL'}"
           f"  (unplayable + actionable reason: {has_video})")
     ok &= placed and has_video
