@@ -17,6 +17,11 @@
  .tile{background:#171a21;border:1px solid #232733;border-radius:8px;padding:8px;width:420px}
  .tile h3{margin:0 0 6px;font-size:13px;display:flex;justify-content:space-between;align-items:center}
  .tile canvas{width:100%;background:#000;border-radius:4px;display:block}
+ .tgl{display:flex;align-items:center;gap:6px;font-size:12px;color:#9aa;
+      background:#171a21;border:1px solid #2b3040;border-radius:6px;padding:0 10px;
+      cursor:pointer;user-select:none;white-space:nowrap}
+ .tgl input{margin:0;cursor:pointer}
+ button.on{background:#1f6feb;border-color:#1f6feb}
  .tile .st{font-size:11px;color:#6b7280;margin-top:4px}
 </style>
 <h1>CCTV Operator Monitoring — Fleet</h1>
@@ -25,7 +30,28 @@
 <div class="row">
   <input id="name" placeholder="Name (e.g. Floor 2 East)" style="max-width:220px">
   <input id="url" placeholder="rtsp://user:pass@host/stream">
-  <button onclick="addCam()">Add</button>
+  <label class="tgl" title="On: add immediately. Off: preview the camera first so you
+can draw a zone or tripwire before it starts.">
+    <input type="checkbox" id="quick-add"> <span>quick add</span>
+  </label>
+  <button id="btn-go">Add</button>
+</div>
+<div id="prev" style="display:none">
+  <div class="tile" style="width:auto;max-width:620px">
+    <h3><span id="prev-title">preview</span><span id="prev-dims" class="dim"></span></h3>
+    <canvas id="prev-canvas"></canvas>
+    <div class="st" id="prev-hint">Draw a tripwire line or an intrusion zone, or add
+      with no geometry (phone-usage detection works either way).</div>
+    <div class="row" style="margin:8px 0 0">
+      <button class="ghost" id="btn-line">Line</button>
+      <button class="ghost" id="btn-zone">Zone</button>
+      <button class="ghost" id="btn-finish" style="display:none">Finish zone</button>
+      <button class="ghost" id="btn-clear">Clear</button>
+      <span style="flex:1"></span>
+      <button id="btn-add">Add camera</button>
+      <button class="ghost" id="btn-cancel">Cancel</button>
+    </div>
+  </div>
 </div>
 <h2>Live view</h2>
 <div id="tiles"><span class="dim">Click “view” on a camera below. Video streams
@@ -130,18 +156,161 @@ async function refresh(){
       ['Conf',e=>typeof e.confidence==='number'?e.confidence.toFixed(2):'']],
      evs.events);
 }
-async function addCam(){
-  const url=document.getElementById('url').value.trim(); if(!url)return;
-  const name=document.getElementById('name').value.trim()||url;
+// ---------- preview + geometry, before the camera is added ----------
+// Geometry is stored NORMALIZED (0..1), which is why drawing on a downscaled
+// preview is valid: the pipeline scales it to whatever the real frame size is, and
+// it stays correct even if placement puts the camera on a different module.
+const prev = {img:null, w:0, h:0, mode:null, pts:[], zone:null, a:null, b:null};
+const $ = id => document.getElementById(id);
+
+function prevRedraw(){
+  const c = $('prev-canvas'), ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  if (prev.img) ctx.drawImage(prev.img, 0, 0, c.width, c.height);
+  const X = x => x * c.width, Y = y => y * c.height;
+  if (prev.zone && prev.zone.length >= 3){
+    ctx.beginPath(); ctx.moveTo(X(prev.zone[0][0]), Y(prev.zone[0][1]));
+    prev.zone.slice(1).forEach(p => ctx.lineTo(X(p[0]), Y(p[1])));
+    ctx.closePath();
+    ctx.fillStyle='rgba(31,111,235,.28)'; ctx.fill();
+    ctx.strokeStyle='#1f6feb'; ctx.lineWidth=2; ctx.stroke();
+  }
+  if (prev.mode==='zone' && prev.pts.length){
+    ctx.strokeStyle='#facc15'; ctx.lineWidth=2; ctx.beginPath();
+    ctx.moveTo(X(prev.pts[0][0]), Y(prev.pts[0][1]));
+    prev.pts.slice(1).forEach(p=>ctx.lineTo(X(p[0]),Y(p[1]))); ctx.stroke();
+    prev.pts.forEach(p=>{ctx.fillStyle='#facc15';ctx.beginPath();
+      ctx.arc(X(p[0]),Y(p[1]),3,0,7);ctx.fill();});
+  }
+  if (prev.a && prev.b){
+    ctx.strokeStyle='#f87171'; ctx.lineWidth=3; ctx.beginPath();
+    ctx.moveTo(X(prev.a[0]),Y(prev.a[1])); ctx.lineTo(X(prev.b[0]),Y(prev.b[1])); ctx.stroke();
+  } else if (prev.a){
+    ctx.fillStyle='#f87171'; ctx.beginPath();
+    ctx.arc(X(prev.a[0]),Y(prev.a[1]),4,0,7); ctx.fill();
+  }
+}
+
+function prevGeometry(){
+  const g = {};
+  if (prev.zone && prev.zone.length>=3) g.zone_polygon = prev.zone;
+  if (prev.a && prev.b){ g.line_start = prev.a; g.line_end = prev.b; }
+  return Object.keys(g).length ? g : null;
+}
+
+async function doPreview(){
+  const url = $('url').value.trim(); if(!url) return;
+  $('prev-hint').textContent = 'opening stream…';
+  $('prev').style.display='';
+  let r;
+  try {
+    r = await j('/api/cameras/probe',{method:'POST',headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify({url})});
+  } catch(e){ $('prev-hint').textContent='preview request failed'; return; }
+  if (r.error){ $('prev-hint').textContent = r.error; return; }
+
+  // Canvas keeps the SOURCE aspect ratio — a squashed preview would put the drawn
+  // zone somewhere other than where it looked.
+  const c = $('prev-canvas'), disp = Math.min(600, r.width);
+  c.width = disp; c.height = Math.round(disp * r.height / r.width);
+  prev.w = r.width; prev.h = r.height;
+  prev.mode=null; prev.pts=[]; prev.zone=null; prev.a=null; prev.b=null;
+  $('prev-title').textContent = $('name').value.trim() || url;
+  $('prev-dims').textContent = `${r.width}×${r.height} @ ${r.fps} fps`
+                             + (r.probed_by?` · via ${r.probed_by}`:'');
+  const im = new Image();
+  im.onload = () => { prev.img = im; prevRedraw();
+    $('prev-hint').textContent='Draw a tripwire line or an intrusion zone, or add with no geometry.'; };
+  im.src = 'data:image/jpeg;base64,' + r.image;
+}
+
+function setMode(m){
+  prev.mode = (prev.mode===m ? null : m);
+  prev.pts = [];
+  $('btn-line').classList.toggle('on', prev.mode==='line');
+  $('btn-zone').classList.toggle('on', prev.mode==='zone');
+  $('btn-finish').style.display = prev.mode==='zone' ? 'inline-block' : 'none';
+  $('prev-hint').textContent = prev.mode==='line'
+    ? 'Click two points for the tripwire.'
+    : prev.mode==='zone' ? 'Click at least 3 points, then Finish zone.'
+    : 'Drawing off.';
+  prevRedraw();
+}
+
+function closePreview(){
+  $('prev').style.display = 'none';
+  prev.img=null; prev.zone=null; prev.a=null; prev.b=null; prev.pts=[]; prev.mode=null;
+}
+
+// `withGeometry` is explicit rather than inferred: quick add must never attach
+// geometry left over from a preview of some *other* URL a moment earlier.
+async function commitCamera(withGeometry){
+  const url = $('url').value.trim(); if(!url) return;
+  const name = $('name').value.trim() || url;
+  const body = {url, name};
+  if (withGeometry){ const g = prevGeometry(); if (g) body.geometry = g; }
   const r = await j('/api/cameras',{method:'POST',headers:{'Content-Type':'application/json'},
-                                   body:JSON.stringify({url,name})});
+                                   body:JSON.stringify(body)});
   if(!r.placed) alert('Camera saved but NOT placed — no module has headroom.\nDeploy another module, or raise frame_stride + CENTRAL_STRIDE.');
-  document.getElementById('url').value='';document.getElementById('name').value='';
+  $('url').value=''; $('name').value='';
+  closePreview();
   refresh();
 }
 async function del(id){ closeView(id); await fetch('/api/cameras/'+id,{method:'DELETE'}); refresh(); }
 // Delegated: the tables are re-rendered every few seconds, so per-button
 // listeners would be lost. One listener on document survives every rebuild.
+// Quick add on  -> the button adds immediately, no preview, no geometry.
+// Quick add off -> the button previews first so a zone/tripwire can be drawn.
+// Persisted, and defaults to quick add (off = opt in to the extra step).
+const quickAdd = () => $('quick-add').checked;
+function syncAddBtn(){
+  $('btn-go').textContent = quickAdd() ? 'Add' : 'Preview';
+  $('btn-go').title = quickAdd()
+    ? 'Adds the camera straight away with no geometry'
+    : 'Fetch a still first so you can draw a zone or tripwire';
+}
+$('quick-add').checked = (localStorage.getItem('quickAdd') ?? '1') === '1';
+$('quick-add').onchange = () => {
+  localStorage.setItem('quickAdd', quickAdd() ? '1' : '0');
+  syncAddBtn();
+  if (quickAdd()) closePreview();      // drop any half-drawn geometry
+};
+syncAddBtn();
+
+$('btn-go').onclick  = () => quickAdd() ? commitCamera(false) : doPreview();
+$('btn-add').onclick = () => commitCamera(true);
+
+// Enter in either field does the obvious thing: if a preview is open and possibly
+// drawn on, it adds WITH that geometry; otherwise it runs the main button, so the
+// quick-add toggle still decides between adding and previewing.
+function onEnterKey(e){
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  if ($('prev').style.display !== 'none') commitCamera(true);
+  else $('btn-go').click();
+}
+$('url').addEventListener('keydown', onEnterKey);
+$('name').addEventListener('keydown', onEnterKey);
+$('btn-cancel').onclick  = closePreview;
+$('btn-line').onclick    = () => setMode('line');
+$('btn-zone').onclick    = () => setMode('zone');
+$('btn-clear').onclick   = () => { prev.pts=[]; prev.zone=null; prev.a=null; prev.b=null;
+                                   setMode(null); };
+$('btn-finish').onclick  = () => {
+  if (prev.pts.length >= 3){ prev.zone = prev.pts.slice(); prev.pts=[]; setMode(null); }
+  else $('prev-hint').textContent = 'A zone needs at least 3 points.';
+};
+$('prev-canvas').onclick = (e) => {
+  if (!prev.mode || !prev.img) return;
+  const r = e.target.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+  if (prev.mode === 'line'){
+    if (!prev.a || (prev.a && prev.b)) { prev.a=[x,y]; prev.b=null; }
+    else prev.b=[x,y];
+  } else prev.pts.push([x,y]);
+  prevRedraw();
+};
+
 document.addEventListener('click', (e) => {
   const v = e.target.closest('.act-view');
   if (v) { toggleView(v.dataset.id, v.dataset.name, v.dataset.ws); return; }

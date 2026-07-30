@@ -269,3 +269,19 @@ each stream's real FPS, so "1 second of phone use" means 1 real second across
 
 The current rule/engine/event separation is designed so these slot in as new
 `BehaviorRule` implementations and new output sinks without rewrites.
+
+## Three things waiting for you on the GPU box:
+
+  1. Check the startup log for NVDEC hardware decode active. vs CUDA decode 
+  unavailable — biggest open unknown, one grep.
+  2. python tests/bench_gpu.py 1920 1080 → set Config.fps_budget from the
+  median column.
+  3. Keep CENTRAL_STRIDE equal to frame_stride when you change either.
+
+  And the two experiments worth doing before more optimisation — I've not
+  recorded these anywhere, so they're worth a note in your tracker:
+
+  - num_workers=0 with ~20 feeds on the GPU. If gap= matches coordinator mode,
+  the worker processes aren't earning their complexity.
+  - Motion gating on one camera — measure what fraction of frames actually need
+  inference. Potentially a larger win than everything from this session.

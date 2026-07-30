@@ -234,6 +234,84 @@ async def set_feed_geometry(feed_id: str, payload: dict) -> JSONResponse:
     return JSONResponse({"applied": applied, "feed_id": feed_id})
 
 
+PROBE_TIMEOUT_S = 25.0
+
+
+def _grab_one_frame(url: str, cfg: Config):
+    """Open a stream, take ONE frame, close. Blocking — call in an executor.
+
+    Returns ``(width, height, fps, frame)``. Deliberately creates no ``Feed``:
+    no registry entry, no ``max_feeds`` slot, no detection, no artefacts. This is
+    what lets the UI show a still for zone/line drawing before the camera is
+    actually added.
+    """
+    source = StreamURLSource(
+        url, max_lag_s=0.0, hw_decode=cfg.hw_decode, stride=1,
+        decode_threads=cfg.decode_threads,
+    ).start()
+    try:
+        for _idx, frame in source.frames():
+            return source.width, source.height, source.fps, frame
+        return source.width, source.height, source.fps, None   # opened but no frames
+    finally:
+        source.close()
+
+
+@app.post("/feeds/probe")
+async def probe_stream(payload: dict) -> JSONResponse:
+    """Return one still frame + the TRUE source dimensions, without adding a feed.
+
+    The dashboard draws zone/line geometry on this preview. ``width``/``height`` are
+    the real source size so the preview keeps the source aspect ratio — drawing on a
+    distorted canvas would put the zone somewhere other than where it looked.
+    The JPEG itself is downscaled for the wire; geometry is normalized 0..1 so the
+    preview's display size is irrelevant to correctness.
+    """
+    import base64
+
+    import cv2
+
+    url = (payload.get("url") or "").strip() if isinstance(payload, dict) else ""
+    if not url:
+        return JSONResponse({"error": "missing 'url'"}, status_code=400)
+
+    cfg = Config()
+    loop = asyncio.get_event_loop()
+    try:
+        w, h, fps, frame = await asyncio.wait_for(
+            loop.run_in_executor(None, _grab_one_frame, url, cfg),
+            timeout=PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": f"stream did not deliver a frame within {PROBE_TIMEOUT_S:.0f}s"},
+            status_code=504,
+        )
+    except Exception as exc:  # noqa: BLE001 - bad URL, auth, unreachable, codec
+        return JSONResponse({"error": f"could not open stream: {exc}"}, status_code=400)
+
+    if frame is None:
+        return JSONResponse({"error": "stream opened but produced no frames"},
+                            status_code=502)
+
+    fh, fw = frame.shape[:2]
+    max_w = int(getattr(cfg, "viewer_max_width", 640))
+    shown = frame
+    if fw > max_w:                     # shrink the wire payload only
+        shown = cv2.resize(frame, (max_w, int(fh * (max_w / fw))))
+    ok, buf = cv2.imencode(".jpg", shown,
+                           [cv2.IMWRITE_JPEG_QUALITY,
+                            int(getattr(cfg, "viewer_jpeg_quality", 70))])
+    if not ok:
+        return JSONResponse({"error": "could not encode preview frame"},
+                            status_code=500)
+    logger.info("Probed %s -> %dx%d @ %.2f fps (no feed created).", url, fw, fh, fps)
+    return JSONResponse({
+        "width": fw, "height": fh, "fps": round(float(fps), 2),
+        "image": base64.b64encode(buf.tobytes()).decode("ascii"),
+    })
+
+
 @app.post("/feeds/stream")
 async def add_stream(payload: dict) -> JSONResponse:
     """Start a background feed from a live stream URL (RTSP / HLS / HTTP).

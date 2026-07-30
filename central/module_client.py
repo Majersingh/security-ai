@@ -81,6 +81,16 @@ class ModuleClient:
     async def feeds(self) -> Dict[str, Any]:
         return await self._call("/feeds")
 
+    async def probe(self, url: str) -> Dict[str, Any]:
+        """One still frame + true source dimensions, without creating a feed.
+
+        Opening an RTSP stream can be slow, so this gets a longer timeout than the
+        other control calls.
+        """
+        return await asyncio.to_thread(
+            _request, f"{self.base}/feeds/probe", "POST", {"url": url}, 30.0
+        )
+
     def video_url(self, feed_id: str) -> str:
         """WebSocket URL the BROWSER uses — video never passes through central."""
         ws = self.base.replace("https://", "wss://").replace("http://", "ws://")

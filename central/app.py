@@ -156,6 +156,41 @@ async def ingest_events(payload: dict,
 
 # --------------------------------------------------------------- camera admin
 
+@app.post("/api/cameras/probe")
+async def probe_camera(payload: dict) -> JSONResponse:
+    """Preview a stream before adding it: one still frame + true source size.
+
+    Borrows any online module to open the stream briefly. No camera is registered
+    and no feed is created, so this is safe to call repeatedly while the user is
+    getting the URL right. The dashboard draws zone/line on the returned frame and
+    then posts url+name+geometry together, so the camera starts already configured
+    instead of running unconfigured until someone remembers to draw.
+    """
+    url = (payload.get("url") or "").strip() if isinstance(payload, dict) else ""
+    if not url:
+        raise HTTPException(400, "missing 'url'")
+
+    online = [m for m in app.state.store.modules(STALE_AFTER) if m["online"]]
+    if not online:
+        return JSONResponse(
+            {"error": "no module is online to open the stream — start a module first"},
+            status_code=503,
+        )
+
+    # Any module can probe; geometry is normalized so it stays valid wherever the
+    # camera is eventually placed. Try each so one sick module doesn't block preview.
+    last = ""
+    for mod in online:
+        try:
+            res = await ModuleClient(mod["url"]).probe(url)
+            res["probed_by"] = mod["id"]
+            return JSONResponse(res)
+        except ModuleError as exc:
+            last = str(exc)
+            logger.warning("Probe via %s failed: %s", mod["id"], exc)
+    return JSONResponse({"error": f"could not preview stream: {last}"}, status_code=502)
+
+
 @app.post("/api/cameras")
 async def add_camera(payload: dict) -> dict:
     """Register a camera and place it on a module with headroom."""
