@@ -97,7 +97,23 @@ class Config:
     log_timing: bool = True  # per-frame TIMING lines (profiling; noisy, and ON here)
 
     # ------------------------------------------------- multi-feed (concurrent)
+    # Admission limit on concurrent feeds. NOT a throughput promise — see
+    # fps_budget below, which is what actually decides how many cameras fit.
     max_feeds: int = 80
+
+    # Aggregate detection throughput of THIS host's GPU, in frames/second, as
+    # measured — not guessed. Reported to central at registration and used for
+    # placement: a camera fits only if
+    #     sum(source_fps / frame_stride for its cameras) + this camera <= fps_budget
+    #
+    # 0 = unknown, and central then falls back to counting `max_feeds` slots — which
+    # means it will happily place 80 cameras on one GPU and every feed on that module
+    # degrades together, with nothing reported as wrong. Set it per host.
+    #
+    # Measured on an RTX 4070 Ti SUPER at imgsz 1280, FP16: ~143 fps with batches of
+    # 4 (~63 fps at batch 1, so the number improves as feed count fills batches).
+    # Re-measure after changing inference_imgsz or switching to TensorRT.
+    fps_budget: float = 0.0
 
     # Drop-when-behind: if a feed can't keep up with real time, skip stale frames
     # so latency stays bounded instead of growing forever (matters under load /

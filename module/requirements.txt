@@ -1,5 +1,9 @@
-# Dependencies for the CCTV operator-monitoring live-stream server.
-# Single file — the app is web-only (FastAPI + WebSocket); there is no CLI.
+# Dependencies for an ANALYSIS MODULE — the deployable unit that owns one GPU,
+# decodes its assigned camera feeds, detects behaviour, and reports events to the
+# central app. This is the heavy stack (torch/CUDA via ultralytics, ~3 GB).
+#
+# The central app deliberately shares NONE of this: see central/requirements.txt.
+# Keeping them apart is what lets central deploy anywhere, without a GPU.
 
 # --- AI / CV stack ---
 ultralytics>=8.3.0        # YOLOv11 detection + built-in ByteTrack tracking
@@ -10,6 +14,9 @@ av>=12.0                  # PyAV: decode RTSP/HLS/HTTP streams (libav; no system
 numpy>=1.26,<2.2          # array math (kept <2.2 for broad wheel compatibility)
 pandas>=2.2.0             # events CSV generation
 
-# --- Web server ---
+# --- Web server (module API + video WebSocket to the browser) ---
 fastapi>=0.115.0          # routes + WebSocket transport
 uvicorn[standard]>=0.30.0 # ASGI server
+
+# --- Reporting to the central app ---
+httpx>=0.27.0             # outbound register / heartbeat / event delivery

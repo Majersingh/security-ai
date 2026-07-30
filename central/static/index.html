@@ -1,0 +1,153 @@
+<title>CCTV Monitoring — Fleet</title>
+<style>
+ body{font:14px system-ui,sans-serif;margin:0;padding:20px;background:#0f1115;color:#e6e6e6}
+ h1{font-size:18px;margin:0 0 16px} h2{font-size:14px;margin:20px 0 8px;color:#9aa}
+ table{border-collapse:collapse;width:100%;margin-bottom:8px}
+ th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #232733;font-size:13px}
+ th{color:#7d8799;font-weight:600}
+ .on{color:#4ade80}.off{color:#f87171}.dim{color:#6b7280}
+ input,button{font:13px system-ui;padding:6px 10px;border-radius:6px;border:1px solid #2b3040;background:#171a21;color:#e6e6e6}
+ button{cursor:pointer;background:#1f6feb;border-color:#1f6feb}
+ button.ghost{background:#171a21;border-color:#2b3040}
+ .row{display:flex;gap:8px;margin-bottom:12px}.row input{flex:1}
+ .cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+ .card{background:#171a21;border:1px solid #232733;border-radius:8px;padding:10px 14px;min-width:120px}
+ .card b{display:block;font-size:20px}
+ #tiles{display:flex;gap:12px;flex-wrap:wrap}
+ .tile{background:#171a21;border:1px solid #232733;border-radius:8px;padding:8px;width:420px}
+ .tile h3{margin:0 0 6px;font-size:13px;display:flex;justify-content:space-between;align-items:center}
+ .tile canvas{width:100%;background:#000;border-radius:4px;display:block}
+ .tile .st{font-size:11px;color:#6b7280;margin-top:4px}
+</style>
+<h1>CCTV Operator Monitoring — Fleet</h1>
+<div class="cards" id="cards"></div>
+<h2>Add camera</h2>
+<div class="row">
+  <input id="name" placeholder="Name (e.g. Floor 2 East)" style="max-width:220px">
+  <input id="url" placeholder="rtsp://user:pass@host/stream">
+  <button onclick="addCam()">Add</button>
+</div>
+<h2>Live view</h2>
+<div id="tiles"><span class="dim">Click “view” on a camera below. Video streams
+  straight from its module — it never passes through central.</span></div>
+<h2>Modules</h2><table id="mods"></table>
+<h2>Cameras</h2><table id="cams"></table>
+<h2>Recent events</h2><table id="evs"></table>
+<script>
+const j = (u,o) => fetch(u,o).then(r=>r.json());
+// Attribute-safe escaping. Camera names are user input and often contain the
+// stream URL, so quotes/&/< must not be able to break out of an attribute.
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+                                .replace(/'/g,'&#39;').replace(/</g,'&lt;');
+const tiles = {};            // camera_id -> {ws, canvas, ctx, frames}
+
+function tbl(el, cols, rows){
+  el.innerHTML = '<tr>'+cols.map(c=>`<th>${c[0]}</th>`).join('')+'</tr>' +
+    (rows.length ? rows.map(r=>'<tr>'+cols.map(c=>`<td>${c[1](r)??''}</td>`).join('')+'</tr>').join('')
+                 : `<tr><td colspan="${cols.length}" class="dim">none</td></tr>`);
+}
+
+// A ws:// URL cannot be navigated to — it only works from JavaScript. So we open
+// it here and paint frames, rather than rendering it as a link.
+function toggleView(camId, name, wsUrl){
+  if (tiles[camId]) { closeView(camId); return; }
+  const box = document.createElement('div');
+  box.className = 'tile'; box.id = 'tile-'+camId;
+  box.innerHTML = `<h3><span>${name}</span>
+      <button class="ghost act-view" data-id="${esc(camId)}"
+        data-name="${esc(name)}" data-ws="${esc(wsUrl)}">close</button></h3>
+    <canvas width="640" height="360"></canvas><div class="st">connecting…</div>`;
+  const holder = document.getElementById('tiles');
+  if (!Object.keys(tiles).length) holder.innerHTML = '';
+  holder.appendChild(box);
+
+  const canvas = box.querySelector('canvas'), st = box.querySelector('.st');
+  const t = {canvas, ctx: canvas.getContext('2d'), frames: 0, st};
+  tiles[camId] = t;
+
+  const ws = new WebSocket(wsUrl);
+  t.ws = ws;
+  ws.onopen  = () => st.textContent = 'connected';
+  ws.onerror = () => st.textContent = 'connection failed — is the module reachable '
+                                    + 'at this address from your browser?';
+  ws.onclose = () => { if (tiles[camId]) st.textContent = 'disconnected'; };
+  ws.onmessage = (msg) => {
+    let d; try { d = JSON.parse(msg.data); } catch(e) { return; }
+    if (d.type === 'error') { st.textContent = 'error: ' + (d.message||''); return; }
+    if (!d.image) return;                       // event-only frame, no picture
+    // Decode first, then paint, so the previous frame stays up (no flicker).
+    const im = new Image();
+    im.onload = () => {
+      if (canvas.width !== im.width) { canvas.width = im.width; canvas.height = im.height; }
+      t.ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
+    };
+    im.src = 'data:image/jpeg;base64,' + d.image;
+    t.frames++;
+    st.textContent = `frame ${d.i ?? '?'} · ${t.frames} received`;
+  };
+  refresh();
+}
+
+function closeView(camId){
+  const t = tiles[camId];
+  if (!t) return;
+  try { if (t.ws && t.ws.readyState <= 1) t.ws.close(); } catch(e){}
+  document.getElementById('tile-'+camId)?.remove();
+  delete tiles[camId];
+  const holder = document.getElementById('tiles');
+  if (!Object.keys(tiles).length)
+    holder.innerHTML = '<span class="dim">Click “view” on a camera below. Video '
+      + 'streams straight from its module — it never passes through central.</span>';
+  refresh();
+}
+
+async function refresh(){
+  const [fleet, cams, evs] = await Promise.all([
+    j('/api/fleet'), j('/api/cameras'), j('/api/events?limit=40')]);
+  document.getElementById('cards').innerHTML = `
+    <div class="card"><span class="dim">Modules online</span><b>${fleet.modules_online}/${fleet.modules_total}</b></div>
+    <div class="card"><span class="dim">Cameras</span><b>${fleet.cameras_placed}/${fleet.cameras_total}</b></div>
+    <div class="card"><span class="dim">Unplaced</span><b>${fleet.cameras_unplaced}</b></div>
+    <div class="card"><span class="dim">Detect fps used</span><b>${fleet.fps_used_total}/${fleet.fps_budget_total||'?'}</b></div>
+    <div class="card"><span class="dim">Viewing</span><b>${Object.keys(tiles).length}</b></div>`;
+  tbl(document.getElementById('mods'),
+     [['Module',m=>m.module_id],['Status',m=>m.online?'<span class="on">online</span>':'<span class="off">offline</span>'],
+      ['Cameras',m=>`${m.cameras}/${m.slots_total}`],['fps used',m=>m.fps_used],['fps free',m=>m.fps_free??'—']],
+     fleet.modules);
+  tbl(document.getElementById('cams'),
+     [['Name',c=>c.name],['Status',c=>c.status],
+      ['Module',c=>c.module_id?c.module_id+(c.module_online?'':' <span class="off">(down)</span>'):'<span class="dim">unplaced</span>'],
+      ['View',c=>c.video_url
+        ? `<button class="ghost act-view" data-id="${esc(c.id)}" data-name="${esc(c.name)}"
+            data-ws="${esc(c.video_url)}">${tiles[c.id]?'stop':'view'}</button>`
+        : '<span class="dim">—</span>'],
+      ['',c=>`<button class="act-del" data-id="${esc(c.id)}">remove</button>`]],
+     cams.cameras);
+  tbl(document.getElementById('evs'),
+     [['When',e=>new Date(e.received_at*1000).toLocaleTimeString()],
+      ['Camera',e=>e.camera_name||e.camera_id.slice(0,8)],
+      ['Event',e=>e.kind],['Person',e=>e.person_id],
+      ['Conf',e=>typeof e.confidence==='number'?e.confidence.toFixed(2):'']],
+     evs.events);
+}
+async function addCam(){
+  const url=document.getElementById('url').value.trim(); if(!url)return;
+  const name=document.getElementById('name').value.trim()||url;
+  const r = await j('/api/cameras',{method:'POST',headers:{'Content-Type':'application/json'},
+                                   body:JSON.stringify({url,name})});
+  if(!r.placed) alert('Camera saved but NOT placed — no module has headroom.\nDeploy another module, or raise frame_stride + CENTRAL_STRIDE.');
+  document.getElementById('url').value='';document.getElementById('name').value='';
+  refresh();
+}
+async function del(id){ closeView(id); await fetch('/api/cameras/'+id,{method:'DELETE'}); refresh(); }
+// Delegated: the tables are re-rendered every few seconds, so per-button
+// listeners would be lost. One listener on document survives every rebuild.
+document.addEventListener('click', (e) => {
+  const v = e.target.closest('.act-view');
+  if (v) { toggleView(v.dataset.id, v.dataset.name, v.dataset.ws); return; }
+  const d = e.target.closest('.act-del');
+  if (d) { del(d.dataset.id); }
+});
+
+refresh(); setInterval(refresh, 3000);
+</script>

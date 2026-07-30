@@ -23,9 +23,12 @@ import logging
 import sys
 from pathlib import Path
 
-# Make the CV package importable.
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+# Make the CV core importable (flat imports: `from config import Config`), and this
+# directory too, so sibling modules like `reporting` resolve when the app is loaded
+# as `module.app:app` — in that case only the repo root is on sys.path, not here.
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "core"))
+sys.path.insert(0, str(ROOT))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
@@ -75,11 +78,56 @@ def _log_hardware() -> None:
         logger.warning("Could not query GPU info (%s); resolved device=%s", exc, device)
 
 
+async def _forward_events_to_central(app: "FastAPI") -> None:
+    """Drain the global events channel and hand violations to the reporter.
+
+    This is the whole integration seam. The channel already carries every event
+    from every feed (worker processes included), keyed by ``feed_id``, so the
+    reporter can be wired in here without touching the CV pipeline, the workers,
+    or the inference process. Central knows cameras by *its* ``camera_id``, so we
+    translate through the mapping recorded when the feed was created.
+    """
+    hub = app.state.pool or app.state.feeds
+    reporter = app.state.reporter
+    queue = hub.subscribe_events()
+    try:
+        while True:
+            msg = await queue.get()
+            events = msg.get("events") or []
+            if not events:
+                continue
+            cam_id = app.state.camera_ids.get(msg.get("feed_id"))
+            if cam_id:
+                reporter.report_events(cam_id, events)
+            # No camera_id means this feed was started directly on the module
+            # (not placed by central) — it still logs locally, just isn't reported.
+    except asyncio.CancelledError:
+        raise
+    finally:
+        hub.unsubscribe_events(queue)
+
+
+def _module_status(app: "FastAPI") -> dict:
+    """Payload for the heartbeat: load + per-camera status, for central."""
+    hub = getattr(app.state, "pool", None) or getattr(app.state, "feeds", None)
+    if hub is None:
+        return {"active_feeds": 0, "feeds": []}
+    feeds = []
+    for f in hub.list():
+        cam_id = app.state.camera_ids.get(f.get("feed_id"))
+        if cam_id:
+            feeds.append({"camera_id": cam_id, "feed_id": f.get("feed_id"),
+                          "status": f.get("status")})
+    return {"active_feeds": hub.count(), "feeds": feeds}
+
+
 @asynccontextmanager
 async def lifespan(app: "FastAPI"):
     logger.info("Server starting up…")
     _log_hardware()
     cfg = Config()
+    # feed_id -> central's camera_id, for attributing events and status upstream.
+    app.state.camera_ids = {}
     # num_workers>0: coordinator mode — N worker processes for the CPU-bound work
     # plus one inference process that owns the GPU. 0: everything here, in-process
     # (simple, no shared memory; the right mode for a few feeds or a CPU-only box).
@@ -95,7 +143,25 @@ async def lifespan(app: "FastAPI"):
         app.state.pool = None
         app.state.feeds = FeedManager(cfg)
         logger.info("In-process mode (num_workers=0).")
+
+    # Report to central if CENTRAL_URL is set; otherwise a no-op and the module
+    # runs exactly as it did standalone.
+    from reporting import CentralReporter
+
+    app.state.reporter = CentralReporter(
+        cfg, status_provider=lambda: _module_status(app)
+    ).start()
+    app.state.event_forwarder = (
+        asyncio.create_task(_forward_events_to_central(app))
+        if app.state.reporter.enabled else None
+    )
+
     yield
+
+    if getattr(app.state, "event_forwarder", None) is not None:
+        app.state.event_forwarder.cancel()
+    if getattr(app.state, "reporter", None) is not None:
+        app.state.reporter.stop()
     if getattr(app.state, "pool", None) is not None:
         app.state.pool.shutdown()
     if getattr(app.state, "feeds", None) is not None:
@@ -117,9 +183,11 @@ async def list_feeds() -> dict:
 async def stop_feed(feed_id: str) -> dict:
     """Ask a running feed to stop."""
     pool = app.state.pool
-    if pool is not None:
-        return {"stopped": pool.stop(feed_id), "feed_id": feed_id}
-    return {"stopped": app.state.feeds.stop(feed_id), "feed_id": feed_id}
+    stopped = (pool.stop(feed_id) if pool is not None
+               else app.state.feeds.stop(feed_id))
+    # Drop the central mapping so it doesn't leak as feeds come and go.
+    app.state.camera_ids.pop(feed_id, None)
+    return {"stopped": stopped, "feed_id": feed_id}
 
 
 def _parse_geometry(msg: dict):
@@ -179,6 +247,9 @@ async def add_stream(payload: dict) -> JSONResponse:
     if not url:
         return JSONResponse({"error": "missing 'url'"}, status_code=400)
     zone, line_start, line_end = _parse_geometry(payload)
+    # Central sends its own camera_id so events can be attributed back to it.
+    # Absent when a feed is started directly against the module (standalone use).
+    camera_id = payload.get("camera_id") if isinstance(payload, dict) else None
 
     pool = app.state.pool
     if pool is not None:
@@ -188,6 +259,8 @@ async def add_stream(payload: dict) -> JSONResponse:
         if feed_id is None:
             return JSONResponse({"error": f"feed limit reached ({pool.max_feeds})"},
                                 status_code=429)
+        if camera_id:
+            app.state.camera_ids[feed_id] = camera_id
         return JSONResponse({"feed_id": feed_id, "name": name})
 
     # ---- in-process mode ----
@@ -213,6 +286,8 @@ async def add_stream(payload: dict) -> JSONResponse:
     except RuntimeError as exc:  # feed limit reached
         source.close()
         return JSONResponse({"error": str(exc)}, status_code=429)
+    if camera_id:
+        app.state.camera_ids[feed.feed_id] = camera_id
     asyncio.create_task(feed.run())
     return JSONResponse({
         "feed_id": feed.feed_id, "name": name,

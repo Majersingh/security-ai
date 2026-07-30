@@ -23,11 +23,21 @@ models/*.engine
 
 # ---- Input / uploaded media (large binaries) ----
 input
+module/input
 uploads/
-tests/
+
+# ---- Generated test artefacts (the test CODE is tracked on purpose) ----
+tests/*-out/
+tests/**/events.csv
 
 # ---- Generated outputs ----
 output
+module/output
+
+# ---- Local environment config (commit only the .env.example files) ----
+.env
+*/.env
+!*/.env.example
 # ---- Ultralytics / training artifacts ----
 runs/
 *.cache

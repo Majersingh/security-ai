@@ -1,0 +1,15 @@
+# Dependencies for the CENTRAL APP — dashboard, camera registry, module registry,
+# placement, and the event store.
+#
+# Deliberately light: NO torch, NO ultralytics, NO CUDA, no OpenCV. Central never
+# touches a frame, so it deploys anywhere (a small VM, a container without a GPU)
+# and its image is tens of MB instead of ~3 GB. Every heavy dependency belongs to
+# the analysis module: see module/requirements.txt.
+
+fastapi>=0.115.0          # REST API + the module WebSocket + dashboard
+uvicorn[standard]>=0.30.0 # ASGI server
+pydantic>=2.9.0           # request/response validation on the module contract
+
+# Storage and outbound HTTP are stdlib on purpose (sqlite3, urllib): three tables
+# and a handful of control-plane calls per camera do not justify an ORM plus an
+# async driver. Move to Postgres when one box can no longer hold fleet events.

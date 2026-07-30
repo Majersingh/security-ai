@@ -10,8 +10,8 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path("/home/am-lp-04/security-ai")
-sys.path.insert(0, str(ROOT / "src"))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "module" / "core"))
 
 from config import Config
 from utils import limit_process_threads, setup_logging
@@ -20,7 +20,7 @@ setup_logging("WARNING")
 limit_process_threads(1, 1)
 
 SCRATCH = Path(__file__).parent / "detect-out"
-VIDEO = str(ROOT / "input" / "operator.mp4")
+VIDEO = str(ROOT / "module" / "input" / "operator.mp4")
 
 
 def base_cfg() -> Config:

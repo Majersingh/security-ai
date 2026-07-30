@@ -7,7 +7,8 @@ associates phones with tracked operators, and streams annotated frames + a live
 events feed to a web dashboard. Many streams run concurrently on a single GPU.
 
 Artefacts kept: per-feed violation snapshots + `events.csv` under
-`output/<feed_id>/`. Video itself is **never stored**.
+`module/output/<feed_id>/`, and — when central is running — every violation in
+central's database. Video itself is **never stored**.
 
 > **Behaviours implemented:** phone-usage, zone-intrusion, line-crossing.
 > Sleeping / gaze / absence detection are intentionally **not** implemented yet
@@ -17,11 +18,16 @@ Artefacts kept: per-feed violation snapshots + `events.csv` under
 
 ## Architecture
 
-The pipeline is deliberately modular — one responsibility per file — so later
-phases plug in without touching the core loop:
+Two deployables. **`central/`** is the fleet's brain (registry, placement, event
+store, dashboard) and needs no GPU. **`module/`** is the analysis unit: one GPU, N
+cameras. Scale by deploying another module — it registers itself with central.
+
+Inside a module the pipeline is one responsibility per file:
 
 ```
-web/server.py   FastAPI: /feeds/* REST + WebSocket transport (stream-only)
+app.py          FastAPI: /feeds/* REST + WebSocket transport (stream-only)
+reporting.py    register + heartbeat + durable event spool -> central
+core/
 sources.py      StreamURLSource: PyAV decode of RTSP/HLS/HTTP (NVDEC when available)
 feeds.py        Feed + FeedManager: concurrent feeds, per-process registry
 workers.py      WorkerPool: coordinator + N worker processes (the CPU-bound work)
@@ -36,10 +42,11 @@ config.py       Config:         every tunable value (typed dataclass)
 utils.py        logging, geometry (IoU/containment), timestamp helpers
 ```
 
-See `docs/ARCHITECTURE.md` for the multi-feed / single-GPU design in depth.
+See `docs/ARCHITECTURE.md` for the design, and `central/SETUP.md` /
+`module/SETUP.md` to run each side.
 
 **Extensibility:** to add a new behaviour (e.g. sleeping), implement a new
-`BehaviorRule` subclass and register it in `build_rules()` (`behavior.py`).
+`BehaviorRule` subclass and register it in `build_rules()` (`module/core/behavior.py`).
 No other file changes. The debounce/episode logic, event logging and snapshots
 are handled generically for every rule.
 
@@ -68,13 +75,17 @@ python -m pip install --upgrade pip
 ### 2. Dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -r module/requirements.txt     # analysis module: the heavy CV stack
+pip install -r central/requirements.txt    # central: fastapi + uvicorn only
 ```
 
-This installs the full stack — Ultralytics (YOLOv11), Supervision (ByteTrack +
-annotators), OpenCV, PyAV (stream decode), NumPy, Pandas, and the web server
-(FastAPI + uvicorn) — from the single `requirements.txt`. The YOLOv11 weight
-(`yolo11n.pt`) is downloaded automatically on first run and cached in `models/`.
+The two share nothing on purpose — central has no torch, no CUDA, no OpenCV, so it
+deploys as a small container anywhere. The module installs Ultralytics (YOLOv11),
+Supervision (ByteTrack + annotators), OpenCV, PyAV, NumPy and Pandas. The YOLOv11
+weight is downloaded on first run and cached in `module/models/`.
+
+Install a **CUDA build of torch** for the module; the default wheel is CPU-only and
+runs ~50x slower.
 
 > GPU strongly recommended for real-time multi-stream inference. Device is
 > auto-detected (`Config.device = "auto"` → CUDA / MPS / CPU).
@@ -83,14 +94,22 @@ annotators), OpenCV, PyAV (stream decode), NumPy, Pandas, and the web server
 
 ## Running
 
-Start the server:
+Start an analysis module (standalone — no central needed):
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m uvicorn --app-dir web server:app \
-    --host 0.0.0.0 --port 8000
+uvicorn module.app:app --host 0.0.0.0 --port 8001
 ```
 
-Open `http://localhost:8000`, paste a camera **stream URL** (RTSP / HLS / HTTP)
+Or run the full fleet — central plus one or more modules:
+
+```bash
+uvicorn central.app:app --env-file central/.env --host 0.0.0.0 --port 9000
+uvicorn module.app:app  --env-file module/.env  --host 0.0.0.0 --port 8001
+```
+
+With central, add cameras on **its** dashboard (port 9000) and it places them on a
+module with headroom. Standalone, open the module directly (port 8001) and paste a
+camera **stream URL** (RTSP / HLS / HTTP)
 and click **Add Stream**. Each stream runs as its own feed; draw a **line** or
 **zone** on a connected stream to add tripwire / intrusion rules. Detected
 violations appear in the events panel and are saved as per-feed snapshots +
@@ -126,26 +145,34 @@ Annotated frames are streamed to the dashboard live; **no video is stored**.
 
 ```
 security-ai/
-  output/           <feed_id>/{events.csv, snapshots/}   (per-feed artefacts)
-  models/           yolo11n.pt            (auto-downloaded weights)
-  src/              detector, tracker, behavior, annotator, events, config,
-                    utils, streaming (FrameProcessor), sources, feeds
-  web/              server.py (FastAPI), static/index.html (dashboard)
+  central/          app.py, db.py, module_client.py, placement.py, static/
+                    SETUP.md, .env.example, requirements.txt   (no GPU, no torch)
+  module/           app.py, reporting.py, static/
+                    core/     the CV pipeline (config, feeds, inference, sources,
+                              streaming, behavior, tracker, annotator, events, utils)
+                    models/   yolo11n.pt        (auto-downloaded)
+                    output/   <feed_id>/{events.csv, snapshots/}
+                    input/    sample media
+                    SETUP.md, .env.example, requirements.txt
+  tests/            ring, e2e, central contract, wired module, batch window
   docs/             ARCHITECTURE.md
-  requirements.txt
-  README.md         SETUP.md
+  README.md
 ```
+
+`module/` is self-contained (models, input, output live inside it) because
+`config.py` derives its root from its own location.
 
 ---
 
 ## How it works
 
 A stream URL is opened by `StreamURLSource` (PyAV) and processed frame by frame
-through `FrameProcessor` (`Detector` → `Tracker` → `BehaviorEngine` →
-`Annotator`). Each stream is a `Feed`; `FeedManager` runs many feeds concurrently
-and **serializes GPU inference behind a shared semaphore** so one GPU is shared
-cleanly. Live streams use **drop-to-latest** (skip stale frames to bound latency)
-and **auto-reconnect**. The browser subscribes over a WebSocket and receives
+through `FrameProcessor` (`Tracker` → `BehaviorEngine` → `Annotator`). Each stream
+is a `Feed`; `FeedManager` runs many feeds concurrently. Detection is **centralized
+in one process that owns the GPU** and batches frames from every feed together, so
+there is one CUDA context and one copy of the weights; identity tracking stays
+per-feed. Live streams **drop stale frames** when they fall behind real time, and
+**auto-reconnect**. The browser subscribes over a WebSocket and receives
 annotated JPEG frames + events; drawn zone/line geometry is pushed back with
 `POST /feeds/{id}/geometry` and applied on the next frame.
 
@@ -162,7 +189,7 @@ Two extra behaviours can be enabled by defining geometry:
   Fires immediately on the first touch and once per touch (re-fires on a fresh
   touch), so a quick pass-through is caught.
 
-Both are implemented as `BehaviorRule` subclasses in `src/behavior.py` and are
+Both are implemented as `BehaviorRule` subclasses in `module/core/behavior.py` and are
 registered automatically by `build_rules()` when geometry is provided — no
 pipeline changes. Events land in the same `events.csv` (`Zone Intrusion`,
 `Line Crossing (in)`/`(out)`), with snapshots.
