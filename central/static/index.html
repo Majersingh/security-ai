@@ -30,6 +30,10 @@
 <div class="row">
   <input id="name" placeholder="Name (e.g. Floor 2 East)" style="max-width:220px">
   <input id="url" placeholder="rtsp://user:pass@host/stream">
+  <select id="module-pick" title="Which module should run this camera. Auto picks the
+one with most headroom; a specific module is honoured strictly and never moved.">
+    <option value="">Auto (best headroom)</option>
+  </select>
   <label class="tgl" title="On: add immediately. Off: preview the camera first so you
 can draw a zone or tripwire before it starts.">
     <input type="checkbox" id="quick-add"> <span>quick add</span>
@@ -136,13 +140,24 @@ async function refresh(){
     <div class="card"><span class="dim">Unplaced</span><b>${fleet.cameras_unplaced}</b></div>
     <div class="card"><span class="dim">Detect fps used</span><b>${fleet.fps_used_total}/${fleet.fps_budget_total||'?'}</b></div>
     <div class="card"><span class="dim">Viewing</span><b>${Object.keys(tiles).length}</b></div>`;
+  const pick = $('module-pick'), was = pick.value;
+  pick.innerHTML = '<option value="">Auto (best headroom)</option>' +
+    fleet.modules.map(m => `<option value="${esc(m.module_id)}"${m.online?'':' disabled'}>`
+      + `${esc(m.module_id)} — ${m.cameras}/${m.slots_total} cams`
+      + (m.fps_free!=null?`, ${m.fps_free} fps free`:'')
+      + (m.online?'':' (offline)') + '</option>').join('');
+  pick.value = was;                       // don't reset mid-typing on refresh
+
   tbl(document.getElementById('mods'),
      [['Module',m=>m.module_id],['Status',m=>m.online?'<span class="on">online</span>':'<span class="off">offline</span>'],
       ['Cameras',m=>`${m.cameras}/${m.slots_total}`],['fps used',m=>m.fps_used],['fps free',m=>m.fps_free??'—']],
      fleet.modules);
   tbl(document.getElementById('cams'),
      [['Name',c=>c.name],['Status',c=>c.status],
-      ['Module',c=>c.module_id?c.module_id+(c.module_online?'':' <span class="off">(down)</span>'):'<span class="dim">unplaced</span>'],
+      ['Module',c=>(c.module_id
+          ? esc(c.module_id)+(c.module_online?'':' <span class="off">(down)</span>')
+          : '<span class="dim">unplaced</span>')
+        + (c.pinned_module?` <span class="dim">📌${esc(c.pinned_module)}</span>`:'')],
       ['View',c=>c.video_url
         ? `<button class="ghost act-view" data-id="${esc(c.id)}" data-name="${esc(c.name)}"
             data-ws="${esc(c.video_url)}">${tiles[c.id]?'stop':'view'}</button>`
@@ -248,6 +263,8 @@ async function commitCamera(withGeometry){
   const url = $('url').value.trim(); if(!url) return;
   const name = $('name').value.trim() || url;
   const body = {url, name};
+  const pick = $('module-pick').value;
+  if (pick) body.module_id = pick;          // pin, instead of auto-placing
   if (withGeometry){ const g = prevGeometry(); if (g) body.geometry = g; }
   const r = await j('/api/cameras',{method:'POST',headers:{'Content-Type':'application/json'},
                                    body:JSON.stringify(body)});

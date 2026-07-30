@@ -170,17 +170,30 @@ async def probe_camera(payload: dict) -> JSONResponse:
     if not url:
         raise HTTPException(400, "missing 'url'")
 
-    online = [m for m in app.state.store.modules(STALE_AFTER) if m["online"]]
+    store: Store = app.state.store
+    online = [m for m in store.modules(STALE_AFTER) if m["online"]]
     if not online:
         return JSONResponse(
             {"error": "no module is online to open the stream — start a module first"},
             status_code=503,
         )
 
-    # Any module can probe; geometry is normalized so it stays valid wherever the
-    # camera is eventually placed. Try each so one sick module doesn't block preview.
+    # Probe on the module that placement would ACTUALLY choose, so "preview worked"
+    # implies "this camera will work once added" — same host, same network, same
+    # route to the camera. Probing an arbitrary module can fail (or succeed) for
+    # reachability reasons that have nothing to do with where the feed will run,
+    # which is misleading once modules sit on different networks.
+    #
+    # Source fps isn't known until we have probed, so assume 30 purely for ordering.
+    likely = choose_module(online, store.cameras(), {"source_fps": 30.0}, FRAME_STRIDE)
+    order = ([m for m in online if m["id"] == likely] +
+             [m for m in online if m["id"] != likely])
+
+    # Still fall through to the others: a sick or unreachable module shouldn't
+    # block preview entirely. Geometry is normalized, so a frame from any module
+    # stays valid wherever the camera is finally placed.
     last = ""
-    for mod in online:
+    for mod in order:
         try:
             res = await ModuleClient(mod["url"]).probe(url)
             res["probed_by"] = mod["id"]
@@ -199,9 +212,14 @@ async def add_camera(payload: dict) -> dict:
         raise HTTPException(400, "missing 'url'")
     name = (payload.get("name") or url).strip()
     geometry = payload.get("geometry")
-    cam_id = app.state.store.add_camera(name, url, geometry)
+    # Optional: pin this camera to a specific module instead of auto-placing.
+    pinned = (payload.get("module_id") or "").strip() or None
+    if pinned and app.state.store.module(pinned) is None:
+        raise HTTPException(400, f"unknown module '{pinned}'")
+
+    cam_id = app.state.store.add_camera(name, url, geometry, pinned_module=pinned)
     placed = await _try_place(app, cam_id)
-    return {"camera_id": cam_id, "name": name, "placed": placed}
+    return {"camera_id": cam_id, "name": name, "placed": placed, "pinned_to": pinned}
 
 
 @app.get("/api/cameras")
@@ -302,13 +320,30 @@ async def _try_place(app: FastAPI, cam_id: str) -> Optional[str]:
     if cam is None or cam.get("module_id"):
         return cam.get("module_id") if cam else None
 
-    module_id = choose_module(store.modules(STALE_AFTER), store.cameras(),
-                              cam, FRAME_STRIDE)
-    if module_id is None:
-        logger.warning("No module has headroom for camera %s (%s) — deploy another.",
-                       cam_id[:8], cam["name"])
-        store.set_camera_status(cam_id, "unplaced")
-        return None
+    modules = store.modules(STALE_AFTER)
+    pinned = cam.get("pinned_module")
+    if pinned:
+        # A pin is honoured strictly and NEVER silently overridden. Users pin a
+        # camera to a module for reasons central can't see — usually that this host
+        # is the one with a network route to it — so quietly relocating it would
+        # break the camera in a way nobody could diagnose. If the pinned module is
+        # down or full, the camera stays unplaced and says so.
+        mod = next((m for m in modules if m["id"] == pinned), None)
+        if mod is None or not mod["online"]:
+            logger.warning("Camera %s (%s) is pinned to module '%s', which is %s — "
+                           "leaving it unplaced rather than moving it.",
+                           cam_id[:8], cam["name"], pinned,
+                           "unknown" if mod is None else "offline")
+            store.set_camera_status(cam_id, "waiting for pinned module")
+            return None
+        module_id = pinned
+    else:
+        module_id = choose_module(modules, store.cameras(), cam, FRAME_STRIDE)
+        if module_id is None:
+            logger.warning("No module has headroom for camera %s (%s) — deploy another.",
+                           cam_id[:8], cam["name"])
+            store.set_camera_status(cam_id, "unplaced")
+            return None
 
     mod = store.module(module_id)
     try:

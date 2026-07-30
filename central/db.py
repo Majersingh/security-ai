@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS cameras (
     status      TEXT NOT NULL DEFAULT 'pending',
     geometry    TEXT,                     -- JSON: zone_polygon/line_start/line_end
     source_fps  REAL NOT NULL DEFAULT 30,
+    pinned_module TEXT,                   -- user pinned this camera to one module
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
@@ -74,7 +75,22 @@ class Store:
         self._db.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self._db.executescript(SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self) -> None:
+        """Add columns missing from an older database.
+
+        `CREATE TABLE IF NOT EXISTS` silently does nothing when the table already
+        exists, so new columns never appear on an upgrade. Until there's a real
+        migration tool, additive ALTERs guarded by the existing column list keep an
+        already-deployed DB working instead of failing on first query.
+        """
+        cols = {r["name"] for r in
+                self._db.execute("PRAGMA table_info(cameras)").fetchall()}
+        for name, decl in (("pinned_module", "TEXT"),):
+            if name not in cols:
+                self._db.execute(f"ALTER TABLE cameras ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         with self._lock:
@@ -124,15 +140,18 @@ class Store:
         return dict(r) if r else None
 
     # ------------------------------------------------------------- cameras
-    def add_camera(self, name: str, url: str, geometry: Optional[dict] = None) -> str:
+    def add_camera(self, name: str, url: str, geometry: Optional[dict] = None,
+                   pinned_module: Optional[str] = None) -> str:
+        """Register a camera. `pinned_module` forces it onto one module."""
         cam_id = uuid.uuid4().hex
         now = time.time()
         with self._lock:
             self._db.execute(
-                """INSERT INTO cameras (id, name, url, geometry, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?)""",
+                """INSERT INTO cameras (id, name, url, geometry, pinned_module,
+                                       created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?)""",
                 (cam_id, name, url,
-                 json.dumps(geometry) if geometry else None, now, now),
+                 json.dumps(geometry) if geometry else None, pinned_module, now, now),
             )
             self._db.commit()
         return cam_id
