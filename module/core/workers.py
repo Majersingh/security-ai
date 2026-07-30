@@ -7,6 +7,9 @@ rules → annotate → encode) in its own process, with its own GIL. That is whe
 the parallelism comes from, because that CPU work — not the GPU — is the
 bottleneck at scale.
 
+Workers serve **no video**: playback is a separate process (``module/rawapp.py``)
+that decodes independently, so nothing here annotates, encodes or relays images.
+
 Workers do **not** own the GPU. Detection is centralized in one inference process
 (:mod:`inference`) that all workers share, so there is one CUDA context, one copy
 of the weights, and one batch queue deep enough to be worth batching.
@@ -106,7 +109,7 @@ async def _worker_loop(
         try:
             feed = mgr.create(source, feed_cfg, msg.get("zone"), msg.get("line_start"),
                               msg.get("line_end"), name=msg.get("name", msg["url"]),
-                              kind="stream", emit_image=True, feed_id=feed_id)
+                              kind="stream", feed_id=feed_id)
         except RuntimeError as exc:
             source.close()
             result_q.put((feed_id, {"type": "error", "feed_id": feed_id, "message": str(exc)}))
@@ -127,10 +130,6 @@ async def _worker_loop(
             f = feeds.get(msg["feed_id"])
             if f:
                 f.set_geometry(msg.get("zone"), msg.get("line_start"), msg.get("line_end"))
-        elif cmd == "view":
-            f = feeds.get(msg["feed_id"])
-            if f:
-                f.set_viewing(msg.get("on", False))
         elif cmd == "shutdown":
             break
 
@@ -157,7 +156,6 @@ class _FeedRec:
     event_count: int = 0
     error: str = ""
     terminal: bool = False        # done/error/stopped — kept visible until cleared
-    subscribers: Set[asyncio.Queue] = field(default_factory=set)
 
 
 class WorkerPool:
@@ -254,25 +252,6 @@ class WorkerPool:
         })
         return True
 
-    # ---- viewer subscription (video) ----
-    def subscribe(self, feed_id: str) -> Optional[asyncio.Queue]:
-        rec = self._feeds.get(feed_id)
-        if rec is None:
-            return None
-        was_empty = not rec.subscribers
-        q: asyncio.Queue = asyncio.Queue(maxsize=1)     # latest-only
-        rec.subscribers.add(q)
-        if was_empty:                                   # first viewer -> start video
-            self._ctrl_qs[rec.worker_id].put({"cmd": "view", "feed_id": feed_id, "on": True})
-        return q
-
-    def unsubscribe(self, feed_id: str, q: asyncio.Queue) -> None:
-        rec = self._feeds.get(feed_id)
-        if rec is not None:
-            rec.subscribers.discard(q)
-            if not rec.subscribers:                     # last viewer left -> stop video
-                self._ctrl_qs[rec.worker_id].put({"cmd": "view", "feed_id": feed_id, "on": False})
-
     # ---- global events channel ----
     def subscribe_events(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -305,7 +284,7 @@ class WorkerPool:
                 self._loop.call_soon_threadsafe(self._dispatch, feed_id, payload)
 
     def _dispatch(self, feed_id: str, payload: dict) -> None:
-        """On the event loop: update the record + fan the payload to viewers."""
+        """On the event loop: update the record + fan events to subscribers."""
         rec = self._feeds.get(feed_id)
         if rec is None:
             return
@@ -334,19 +313,6 @@ class WorkerPool:
                 except asyncio.QueueFull:
                     pass
 
-        # Video viewers: image frames, plus terminal messages so their socket
-        # closes. (Event-only frames carry no image and aren't video-relevant.)
-        if payload.get("image") or ptype in ("done", "error"):
-            for q in list(rec.subscribers):
-                try:
-                    q.put_nowait(payload)
-                except asyncio.QueueFull:
-                    try:
-                        q.get_nowait()
-                        q.put_nowait(payload)
-                    except Exception:  # noqa: BLE001
-                        pass
-
         if ptype in ("done", "error") and not rec.terminal:
             # Keep the record (visible in GET /feeds so the UI can show the
             # done/error state); just free the worker slot for balancing.
@@ -355,8 +321,8 @@ class WorkerPool:
 
 
 def _rec_info(rec: _FeedRec) -> dict:
-    # Build manually — asdict() would deep-copy `subscribers` (asyncio.Queue
-    # objects hold a _contextvars.Context that can't be copied).
+    # Built manually rather than with asdict(), which is now merely a habit worth
+    # keeping: it used to be required because the record held asyncio.Queues.
     return {
         "feed_id": rec.feed_id, "name": rec.name, "kind": rec.kind,
         "status": rec.status, "fps": rec.fps, "width": rec.width,

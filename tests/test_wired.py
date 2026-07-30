@@ -120,7 +120,7 @@ def main() -> int:
                    if c["id"] == cam_id)
         print(f"  2. central placed camera on it ............ "
               f"{'PASS' if placed else 'FAIL'}  (feed_id={cam.get('feed_id')}, "
-              f"video={'yes' if cam.get('video_url') else 'no'})")
+              f"playable={cam.get('playable')})")
         ok &= placed
 
         # 4. module reports OUR camera_id back in its heartbeat -> status tracks

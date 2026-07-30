@@ -7,7 +7,8 @@
      it must never be quietly relocated, since a pin usually encodes network
      reachability that central cannot see
   5. the pin survives module death: when it comes back, the camera lands there
-  6. an old database without the column is migrated, not broken
+  6. a fresh database has the pinning column (schema is disposable — there are
+     no migrations; a schema change means deleting the file)
 """
 import json
 import sys
@@ -90,17 +91,8 @@ def main() -> int:
 
     tmp = Path(tempfile.mkdtemp())
 
-    # 6. pre-create a DB with the OLD cameras schema (no pinned_module column)
-    old = tmp / "old.db"
-    con = sqlite3.connect(old)
-    con.executescript("""CREATE TABLE cameras (id TEXT PRIMARY KEY, name TEXT NOT NULL,
-        url TEXT NOT NULL, module_id TEXT, feed_id TEXT,
-        status TEXT NOT NULL DEFAULT 'pending', geometry TEXT,
-        source_fps REAL NOT NULL DEFAULT 30, created_at REAL NOT NULL,
-        updated_at REAL NOT NULL);""")
-    con.commit(); con.close()
-
-    os.environ.update({"CENTRAL_DB": str(old), "CENTRAL_TOKEN": "",
+    db = tmp / "fresh.db"
+    os.environ.update({"CENTRAL_DB": str(db), "CENTRAL_TOKEN": "",
                        "CENTRAL_STRIDE": "10", "CENTRAL_STALE_AFTER": "4"})
     import uvicorn
 
@@ -119,11 +111,10 @@ def main() -> int:
             time.sleep(0.1)
 
     ok = True
-    migrated = "pinned_module" in {r[1] for r in
-                                   sqlite3.connect(old).execute(
-                                       "PRAGMA table_info(cameras)")}
-    print(f"  6. old DB migrated (column added) ......... {'PASS' if migrated else 'FAIL'}")
-    ok &= migrated
+    cols = {r[1] for r in sqlite3.connect(db).execute("PRAGMA table_info(cameras)")}
+    fresh_ok = "pinned_module" in cols
+    print(f"  6. fresh DB has the pinning column ....... {'PASS' if fresh_ok else 'FAIL'}")
+    ok &= fresh_ok
 
     register("mod-a", 9442, slots=50)
     register("mod-b", 9443, slots=50)

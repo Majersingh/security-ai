@@ -30,6 +30,11 @@ uploads/
 tests/*-out/
 tests/**/events.csv
 
+# ---- Central's database (disposable: delete it to apply a schema change) ----
+central/*.db
+central/*.db-shm
+central/*.db-wal
+
 # ---- Generated outputs ----
 output
 module/output

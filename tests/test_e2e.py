@@ -1,5 +1,8 @@
 """End-to-end: coordinator + 2 worker processes + 1 inference process, 2 feeds.
 
+Detection only — the pipeline serves no video (that is module/rawapp.py), so this
+checks events, progress and completion, and asserts no payload carries an image.
+
 Runs the real pipeline on input/operator.mp4. imgsz/stride are lowered FOR THE
 TEST ONLY (this box is CPU-only, 2 physical cores) — the shipped defaults are
 untouched.
@@ -52,55 +55,28 @@ async def main() -> int:
         ids.append(fid)
     print(f"[test] added feeds: {[f[:8] for f in ids]}")
 
-    # Subscribe as a viewer so the annotate + JPEG-encode path runs too.
-    view_qs = {}
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline and len(view_qs) < len(ids):
-        for fid in ids:
-            if fid not in view_qs:
-                q = pool.subscribe(fid)
-                if q is not None:
-                    view_qs[fid] = q
-        await asyncio.sleep(0.2)
-
-    frames = {f: 0 for f in ids}
-    images = {f: 0 for f in ids}
-    types = {}
-    terminal = {}
+    # No per-feed video queues any more: progress comes from the coordinator's
+    # records, violations from the global events channel.
     n_events = 0
-    boxes_seen = 0
+    images = 0
     t_end = time.monotonic() + 45
     while time.monotonic() < t_end:
-        for fid, q in view_qs.items():
-            try:
-                payload = q.get_nowait()
-            except asyncio.QueueEmpty:
-                continue
-            t = payload.get("type")
-            types[t] = types.get(t, 0) + 1
-            if t in ("done", "error"):
-                terminal[fid[:8]] = (t, payload.get("message", ""))
-            if t == "frame":
-                frames[fid] += 1
-                if payload.get("image"):
-                    images[fid] += 1
-                boxes_seen += len(payload.get("boxes") or [])
         try:
             while True:
                 ev = events_q.get_nowait()
                 n_events += len(ev.get("events") or [])
+                if ev.get("image"):
+                    images += 1          # must never happen: nothing encodes now
         except asyncio.QueueEmpty:
             pass
-        await asyncio.sleep(0.05)
+        if all(f["status"] in ("done", "error") for f in pool.list()):
+            break
+        await asyncio.sleep(0.2)
 
     info = {f["feed_id"][:8]: (f["status"], f["frame_index"], f["worker_id"])
             for f in pool.list()}
     print(f"[test] feed status (status, frame_index, worker): {info}")
-    print(f"[test] viewer frames: { {k[:8]: v for k, v in frames.items()} }")
-    print(f"[test] with JPEG image: { {k[:8]: v for k, v in images.items()} }")
-    print(f"[test] boxes in payloads: {boxes_seen} | events: {n_events}")
-    print(f"[test] payload types: {types}")
-    print(f"[test] terminal payloads: {terminal}")
+    print(f"[test] events seen: {n_events} | payloads carrying an image: {images}")
 
     workers_used = {f["worker_id"] for f in pool.list()}
     print(f"[test] distinct workers used: {sorted(workers_used)}")
@@ -108,11 +84,12 @@ async def main() -> int:
     pool.shutdown()
     print("[test] pool shut down")
 
+    recs = pool.list()
     ok = (
-        all(v > 0 for v in frames.values())
-        and all(v > 0 for v in images.values())
-        and len(workers_used) == 2
-        and not any(t[0] == "error" for t in terminal.values())
+        len(workers_used) == 2                       # both workers were used
+        and all(f["status"] == "done" for f in recs)  # both feeds ran to completion
+        and all(f["frame_index"] > 0 for f in recs)   # progress reached the coordinator
+        and images == 0                              # nothing encodes video any more
     )
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

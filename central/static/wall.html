@@ -1,0 +1,190 @@
+<title>Video wall — CCTV Monitoring</title>
+<style>
+ *{box-sizing:border-box}
+ body{font:14px system-ui,sans-serif;margin:0;padding:12px;background:#0b0d11;color:#e6e6e6}
+ header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+ h1{font-size:15px;margin:0;color:#9aa;white-space:nowrap}
+ a{color:#6b8dd6}
+ select,button{font:13px system-ui;padding:5px 9px;border-radius:6px;
+   border:1px solid #2b3040;background:#171a21;color:#e6e6e6;cursor:pointer}
+ .picker{display:flex;gap:6px;flex-wrap:wrap;flex:1}
+ .chip{display:flex;align-items:center;gap:5px;font-size:12px;padding:3px 9px;
+   border:1px solid #2b3040;border-radius:99px;background:#171a21;cursor:pointer;
+   user-select:none;white-space:nowrap}
+ .chip.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+ .chip.off{opacity:.45;cursor:not-allowed}
+ #wall{display:grid;gap:8px}
+ .cell{background:#000;border:1px solid #1c2028;border-radius:6px;overflow:hidden;
+   position:relative;aspect-ratio:16/9}
+ .cell canvas{width:100%;height:100%;display:block;object-fit:contain}
+ .cell .lbl{position:absolute;left:0;right:0;bottom:0;padding:3px 7px;font-size:11px;
+   background:linear-gradient(transparent,rgba(0,0,0,.8));display:flex;
+   justify-content:space-between;pointer-events:none}
+ .cell .lbl .s{color:#9aa}
+ .empty{color:#6b7280;padding:30px 0}
+</style>
+<header>
+  <h1>Video wall</h1>
+  <span class="picker" id="picker"></span>
+  <label style="font-size:12px;color:#9aa">per row
+    <select id="cols">
+      <option value="auto" selected>auto</option>
+      <option>2</option><option>3</option><option>4</option>
+      <option>5</option><option>6</option><option>8</option>
+    </select>
+  </label>
+  <button id="all">all</button><button id="none">none</button>
+  <a href="/">← dashboard</a>
+</header>
+<div id="notice" style="display:none;background:#2a1f10;border:1px solid #6b4a13;
+  border-radius:8px;padding:12px 14px;margin-bottom:10px;font-size:13px;line-height:1.6">
+</div>
+<div id="wall"></div>
+<div class="empty" id="empty">Select cameras above to start their video.
+  Each tile opens a stream from its own module — nothing is relayed through central,
+  and a camera you are not watching costs no encoding.</div>
+<script>
+const live = {};                 // camera_id -> {ws, ctx, cell, lbl, frames}
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+                                .replace(/'/g,'&#39;').replace(/</g,'&lt;');
+const $ = id => document.getElementById(id);
+let cams = [];
+
+// Column count. "auto" tracks viewport width so a 4K 76" wall gets 5 across while a
+// laptop gets 3 — a plain minmax() grid would put 9+ tiles per row on a big screen,
+// which is unusable for monitoring.
+function columns(){
+  const v = $('cols').value;
+  if (v !== 'auto') return parseInt(v, 10);
+  const w = window.innerWidth;
+  if (w < 1000) return 2;
+  if (w < 1600) return 3;
+  if (w < 2400) return 4;
+  return 5;
+}
+function layout(){
+  const n = Math.max(1, Math.min(columns(), Object.keys(live).length || 1));
+  $('wall').style.gridTemplateColumns = `repeat(${n}, minmax(0, 1fr))`;
+  $('empty').style.display = Object.keys(live).length ? 'none' : '';
+}
+window.addEventListener('resize', layout);
+$('cols').onchange = layout;
+
+async function wsUrlFor(cam){
+  // Central asks the module's raw-video service for a short-lived ticket. The RTSP
+  // URL (and any credentials in it) never reaches the browser.
+  try {
+    const r = await fetch(`/api/cameras/${cam.id}/raw`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({width: 960})}).then(r=>r.json());
+    return r.ws_url || null;
+  } catch(e){ return null; }
+}
+
+async function start(cam){
+  if (live[cam.id]) return;
+  const url = await wsUrlFor(cam);
+  if (!url){ return; }
+  const cell = document.createElement('div');
+  cell.className = 'cell'; cell.id = 'cell-' + cam.id;
+  cell.innerHTML = `<canvas width="640" height="360"></canvas>
+    <div class="lbl"><span>${esc(cam.name)}</span><span class="s">connecting…</span></div>`;
+  $('wall').appendChild(cell);
+  const canvas = cell.querySelector('canvas');
+  const t = {cell, ctx: canvas.getContext('2d'), canvas,
+             lbl: cell.querySelector('.s'), frames: 0, last: performance.now(), fps: 0};
+  live[cam.id] = t;
+
+  const ws = new WebSocket(url);
+  t.ws = ws;
+  ws.onopen = () => t.lbl.textContent = 'live';
+  ws.onerror = () => t.lbl.textContent = 'unreachable';
+  ws.onclose = () => { if (live[cam.id]) t.lbl.textContent = 'closed'; };
+  ws.onmessage = (m) => {
+    let d; try { d = JSON.parse(m.data); } catch(e){ return; }
+    if (d.type === 'error'){ t.lbl.textContent = d.message || 'error'; return; }
+    if (d.type === 'meta'){ t.lbl.textContent = `${d.width}×${d.height} ${d.decode||''}`;
+                            return; }
+    if (!d.image) return;
+    const im = new Image();
+    im.onload = () => {
+      if (t.canvas.width !== im.width){ t.canvas.width = im.width; t.canvas.height = im.height; }
+      t.ctx.drawImage(im, 0, 0);
+    };
+    im.src = 'data:image/jpeg;base64,' + d.image;
+    t.frames++;
+    const now = performance.now();
+    if (now - t.last > 1000){
+      t.fps = (t.frames * 1000 / (now - t.last)).toFixed(1);
+      t.frames = 0; t.last = now;
+      t.lbl.textContent = t.fps + ' fps';
+    }
+  };
+  layout(); paintPicker();
+}
+
+function stop(id){
+  const t = live[id]; if (!t) return;
+  try { if (t.ws && t.ws.readyState <= 1) t.ws.close(); } catch(e){}
+  t.cell.remove(); delete live[id];
+  layout(); paintPicker();
+}
+
+function paintNotice(){
+  const box = $('notice');
+  const placed  = cams.filter(c => c.module_id);
+  const noRaw   = placed.filter(c => !c.playable &&
+                    (c.playable_reason || '').includes('raw video service'));
+  if (placed.length && noRaw.length === placed.length){
+    // Every placed camera is blocked for the same reason: nothing is serving video.
+    box.style.display = '';
+    box.innerHTML = `<b>No raw video service is running.</b> Detection is unaffected —
+      it just cannot play video. Start it on the module host, alongside the detection
+      service:<br>
+      <code style="display:inline-block;margin:6px 0;padding:4px 8px;background:#11131a;
+        border-radius:4px">uvicorn module.rawapp:app --host 0.0.0.0 --port 8011</code><br>
+      then set <code>RAW_PUBLIC_URL</code> in <code>module/.env</code> to where your
+      browser reaches it (port 8011) and restart the detection service so it
+      re-registers.`;
+  } else if (noRaw.length){
+    box.style.display = '';
+    box.innerHTML = `<b>${noRaw.length} camera(s) cannot play video:</b> their module
+      is not running the raw video service. Others are fine.`;
+  } else {
+    box.style.display = 'none';
+  }
+}
+
+function paintPicker(){
+  paintNotice();
+  $('picker').innerHTML = cams.map(c => {
+    if (!c.playable) return `<span class="chip off"
+      title="${esc(c.playable_reason || 'not playable')}"
+      >${esc(c.name)} ⚠</span>`;
+    return `<span class="chip ${live[c.id]?'on':''}" data-id="${esc(c.id)}"
+      >${live[c.id]?'◉':'○'} ${esc(c.name)}</span>`;
+  }).join('') || '<span class="empty">no cameras — add some on the dashboard</span>';
+}
+
+$('picker').onclick = (e) => {
+  const chip = e.target.closest('.chip[data-id]'); if (!chip) return;
+  const id = chip.dataset.id;
+  live[id] ? stop(id) : start(cams.find(c => c.id === id));
+};
+$('all').onclick  = () => cams.forEach(c => c.playable && start(c));
+$('none').onclick = () => Object.keys(live).forEach(stop);
+
+async function poll(){
+  try {
+    const r = await fetch('/api/cameras').then(r => r.json());
+    cams = r.cameras || [];
+    // Drop tiles whose camera vanished or lost its module.
+    Object.keys(live).forEach(id => {
+      const c = cams.find(x => x.id === id);
+      if (!c || !c.playable) stop(id);
+    });
+    paintPicker();
+  } catch(e){}
+}
+poll(); setInterval(poll, 5000); layout();
+</script>

@@ -8,6 +8,12 @@ being enough to hold the fleet's events — the queries here are ordinary SQL.
 All access goes through :class:`Store`, which serialises writes behind a lock and
 is safe to call from FastAPI's threadpool. Reads use ``row_factory`` so callers
 get dicts, not tuples.
+
+**The database is disposable.** There are deliberately no migrations: schema
+changes are applied by deleting the file and letting it be recreated. Cameras are
+re-added and modules re-register themselves, so nothing important is lost. Once
+event history has to survive a schema change, this needs a real migration story —
+until then, additive ALTERs would be ceremony for data nobody keeps.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS modules (
     id            TEXT PRIMARY KEY,
     url           TEXT NOT NULL,          -- how central and browsers reach it
+    raw_url       TEXT,                   -- separate raw-video service, if any
     gpu           TEXT,
     max_feeds     INTEGER NOT NULL DEFAULT 0,
     fps_budget    REAL    NOT NULL DEFAULT 0,   -- measured aggregate detect fps
@@ -75,22 +82,7 @@ class Store:
         self._db.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self._db.executescript(SCHEMA)
-            self._migrate()
             self._db.commit()
-
-    def _migrate(self) -> None:
-        """Add columns missing from an older database.
-
-        `CREATE TABLE IF NOT EXISTS` silently does nothing when the table already
-        exists, so new columns never appear on an upgrade. Until there's a real
-        migration tool, additive ALTERs guarded by the existing column list keep an
-        already-deployed DB working instead of failing on first query.
-        """
-        cols = {r["name"] for r in
-                self._db.execute("PRAGMA table_info(cameras)").fetchall()}
-        for name, decl in (("pinned_module", "TEXT"),):
-            if name not in cols:
-                self._db.execute(f"ALTER TABLE cameras ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         with self._lock:
@@ -101,15 +93,16 @@ class Store:
         now = time.time()
         with self._lock:
             self._db.execute(
-                """INSERT INTO modules (id, url, gpu, max_feeds, fps_budget, version,
-                                        registered_at, last_seen, active_feeds)
-                   VALUES (?,?,?,?,?,?,?,?,0)
+                """INSERT INTO modules (id, url, raw_url, gpu, max_feeds, fps_budget,
+                                        version, registered_at, last_seen, active_feeds)
+                   VALUES (?,?,?,?,?,?,?,?,?,0)
                    ON CONFLICT(id) DO UPDATE SET
-                     url=excluded.url, gpu=excluded.gpu,
+                     url=excluded.url, raw_url=excluded.raw_url, gpu=excluded.gpu,
                      max_feeds=excluded.max_feeds, fps_budget=excluded.fps_budget,
                      version=excluded.version, last_seen=excluded.last_seen""",
-                (mod["id"], mod["url"], mod.get("gpu"), int(mod.get("max_feeds", 0)),
-                 float(mod.get("fps_budget", 0)), mod.get("version"), now, now),
+                (mod["id"], mod["url"], mod.get("raw_url") or None, mod.get("gpu"),
+                 int(mod.get("max_feeds", 0)), float(mod.get("fps_budget", 0)),
+                 mod.get("version"), now, now),
             )
             self._db.commit()
 

@@ -22,7 +22,7 @@ cp central/.env.example central/.env     # then edit
 
 | Variable | Why it matters |
 |---|---|
-| `CENTRAL_DB` | SQLite file. **Back it up** — it is the camera registry *and* the violation history. |
+| `CENTRAL_DB` | SQLite file: camera registry *and* violation history. **Disposable — there are no migrations.** A schema change means deleting it; cameras are re-added and modules re-register. |
 | `CENTRAL_TOKEN` | Shared secret modules must present. Empty = any host can register as a module. |
 | `CENTRAL_STRIDE` | Must match `frame_stride` in `module/core/config.py`, or placement miscalculates capacity. |
 | `CENTRAL_STALE_AFTER` | Seconds of silence before a module is declared dead and its cameras are re-placed. |
@@ -33,7 +33,8 @@ cp central/.env.example central/.env     # then edit
 uvicorn central.app:app --env-file central/.env --host 0.0.0.0 --port 9000
 ```
 
-Dashboard at `http://<host>:9000/`. Expect this on a clean start:
+Dashboard at `http://<host>:9000/`, video wall at `http://<host>:9000/wall`
+(responsive: 3 tiles per row on a laptop, 5 on a 4K wall, or pick a count). Expect this on a clean start:
 
 ```
 Central up. db=central/central.db token=set stride=1
@@ -59,7 +60,12 @@ python tests/test_central.py       # stub module: register, place, ingest, reap,
 
 ## Adding cameras
 
-Via the dashboard, or:
+On the dashboard: paste the URL, then either **quick add** (straight in) or
+**Preview** — which fetches one still frame so you can draw a tripwire line or an
+intrusion zone *before* the camera starts, so it never runs unconfigured. A module
+dropdown pins the camera to a specific host; leave it on Auto for most headroom.
+
+Or by API:
 
 ```bash
 curl -X POST localhost:9000/api/cameras \
@@ -71,6 +77,14 @@ The response includes `"placed"`. **`"placed": null` is a real answer, not an
 error** — it means no online module had headroom, and the fix is to deploy another
 module, not to retry. The camera stays registered and is placed automatically as
 soon as capacity appears.
+
+## Pinning
+
+`POST /api/cameras {module_id: "gpu-host-2"}` forces a camera onto one module. A pin
+is **never silently overridden**: if that module is offline the camera stays unplaced
+with status `waiting for pinned module`, because people pin for reasons central
+cannot see (usually network reachability) and relocating it would break the camera
+with nothing explaining why.
 
 ## Scaling
 
@@ -84,14 +98,19 @@ start landing on it. Nothing here is edited and central is not restarted.
 | `GET /api/fleet` | capacity view: per-module commitment and headroom |
 | `GET/POST /api/cameras`, `DELETE /api/cameras/{id}` | camera registry |
 | `POST /api/cameras/{id}/geometry` | zone/line, persisted and pushed live to the module |
+| `POST /api/cameras/probe` | one still frame, to draw geometry before adding |
+| `POST /api/cameras/{id}/raw` | short-lived WebSocket URL for live video |
 | `GET /api/events?limit=&camera_id=` | violation history |
 | `POST /api/modules/register`, `/api/modules/{id}/heartbeat`, `/api/events` | the module contract (token-checked) |
 
 ## Things to know
 
-**Video never passes through central.** `GET /api/cameras` returns a `video_url`
-pointing at the owning module's WebSocket; the browser connects there directly.
-Central only hands out the address.
+**Video never passes through central, and the detection module serves none.**
+Playback is a separate process per host (`module/rawapp.py`) that decodes
+independently at the source frame rate — display used to be capped by *detection*
+fps, which made smooth video impossible. `POST /api/cameras/{id}/raw` returns a
+short-lived WebSocket URL on that service; the browser connects to it directly.
+Cameras show `playable: true` only when their module advertises the raw service.
 
 **Cameras are sticky to a module.** Track identities and the violation debounce
 state machine are sequential per feed, so a camera cannot be moved mid-stream

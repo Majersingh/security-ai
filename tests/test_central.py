@@ -135,9 +135,13 @@ def main() -> int:
     cam1 = r["camera_id"]
     cams = get("/api/cameras")["cameras"]
     placed = cams[0]["module_id"] == "mod-a" and cams[0]["status"] == "running"
-    has_video = bool(cams[0]["video_url"] and cams[0]["video_url"].startswith("ws://"))
+    # Stub module advertises no raw_url, so it must be unplayable AND say why in a
+    # way a user can act on — this string is shown in the dashboard and the wall.
+    has_video = cams[0]["playable"] is False
+    reason = cams[0].get("playable_reason") or ""
+    has_video = has_video and "raw video service" in reason and "rawapp" in reason
     print(f"  2. camera placed on module ................ {'PASS' if placed else 'FAIL'}"
-          f"  (video_url handed out: {has_video})")
+          f"  (unplayable + actionable reason: {has_video})")
     ok &= placed and has_video
 
     # 3. events ingested

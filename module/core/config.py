@@ -175,14 +175,24 @@ class Config:
         default_factory=lambda: [(1080, 1920), (480, 640)]      # 16:9, 4:3
     )
 
-    # ---- Viewer stream (browser delivery) ----
-    # Annotated frames sent to browsers are throttled + shrunk INDEPENDENTLY of
-    # detection, so remote viewing (especially over a tunnel) stays smooth even
-    # though the server processes far faster. Detection still runs on every
-    # processed frame; frames that carry events are always forwarded.
-    viewer_max_fps: float = 12.0
-    viewer_max_width: int = 640
-    viewer_jpeg_quality: int = 45
+    # ---- Raw video playback (independent of detection) ----
+    # A separate decode purely for smooth viewing: source frame rate, no stride, no
+    # model. Display fps is otherwise capped by DETECTION fps, which makes smooth
+    # video impossible without spending the whole GPU on a few cameras.
+    # Costs one extra decode per WATCHED camera, so the cap below is what stops a
+    # video wall's "all" button from swamping the box.
+    # The raw video service runs as its own PROCESS (module/rawapp.py) so that
+    # pushing frames at source rate cannot add latency to the detection app's event
+    # loop. It decodes and JPEG-encodes only — never the model.
+    # Still frame served by /feeds/probe for drawing zone/line geometry. This is the
+    # ONLY image the detection service produces — video playback is elsewhere.
+    probe_max_width: int = 960      # downscale for the wire; true size is reported
+    probe_jpeg_quality: int = 75    # a still to draw on: worth more than stream quality
+
+    raw_max_streams: int = 16
+    raw_cv_threads: int = 2         # OpenCV threads in the raw service process
+    raw_max_width: int = 960        # downscale for the wire; 0-ish = source
+    raw_jpeg_quality: int = 55
 
     # ---- Multiprocess workers (escape the single-process GIL) ----
     # 0 = run everything in the web process: simple, no shared memory, no

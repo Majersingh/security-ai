@@ -1,8 +1,20 @@
 # Analysis module — setup
 
 The deployable unit: owns **one GPU**, decodes its assigned camera feeds, detects
-behaviour, streams annotated video to browsers, and reports events to central.
-Deploy one per GPU host; that is how the system scales.
+behaviour, and reports events to central. Deploy one per GPU host; that is how the
+system scales.
+
+Two processes, deliberately separate:
+
+| Process | Port | Does | Serves video? |
+|---|---|---|---|
+| `module.app:app` | 8001 | detection, tracking, rules, events | **no** |
+| `module.rawapp:app` | 8011 | raw playback at source frame rate | yes, only this |
+
+Display fps used to be capped by *detection* fps, which made smooth video impossible
+without spending the whole GPU on a few cameras. Splitting them fixed that: the
+detection service now produces exactly one image ever — the still frame for drawing
+zone/line geometry (`/feeds/probe`).
 
 ## Install
 
@@ -33,10 +45,11 @@ cp module/.env.example module/.env      # then edit
 
 | Variable | Notes |
 |---|---|
-| `CENTRAL_URL` | Leave **empty** to run standalone (serves `/feeds/*` and its own dashboard, reports nothing). Supported mode. |
+| `CENTRAL_URL` | Leave **empty** to run standalone (serves `/feeds/*`, reports nothing). Supported mode. |
 | `MODULE_TOKEN` | Must match `CENTRAL_TOKEN` on central. |
 | `MODULE_ID` | Stable per host. Unset = random id, so a restart looks like a new module to central. |
-| `MODULE_PUBLIC_URL` | Where **browsers** reach this box for video. Not `127.0.0.1`, not a docker-internal name. |
+| `MODULE_PUBLIC_URL` | Where central reaches this box (port 8001). |
+| `RAW_PUBLIC_URL` | Where **browsers** reach the raw video service (port 8011). Blank = this host serves no video and cameras show `playable: false`. Not `127.0.0.1` unless the browser is on this machine. |
 
 **2. `module/core/config.py` — pipeline tuning**
 
@@ -48,17 +61,24 @@ order of impact:
 | `frame_stride` | Frames analysed = `source_fps / stride`. **The main capacity dial.** Must match `CENTRAL_STRIDE`. |
 | `inference_imgsz` | 1280 detects small/distant phones; 640 is ~4x cheaper and misses them. Verified on real footage. |
 | `hw_decode` | NVDEC. Software decode is the largest per-feed CPU cost. |
-| `num_workers` | Worker processes for decode/track/annotate. Defaults to physical cores, capped 8 — **raise the cap on a big box**. |
+| `num_workers` | Worker processes for decode/track/rules. Defaults to physical cores, capped 8 — **raise the cap on a big box**. |
 | `cv_threads` / `torch_threads` | 1 each. Do not raise: parallelism comes from feed count, not per-feed threads. |
 | `infer_threads` | The inference process — deliberately **not** 1, because ultralytics preprocesses on CPU there. 0 = auto. |
 | `warmup_shapes` | One entry per camera **aspect ratio** you deploy (resolution is irrelevant). |
+| `fps_budget` | Measured aggregate detection fps for this GPU. **0 means central only counts slots and will overcommit the host.** Get it from `tests/bench_gpu.py`. |
 | `max_feeds` | Admission limit, not a throughput promise. |
+| `raw_max_streams` | Concurrent raw decodes (16). Caps what a video wall's "all" can start. |
+| `probe_max_width` / `probe_jpeg_quality` | The geometry still frame — the only image detection produces. |
 
 ## Run
 
 ```bash
-uvicorn module.app:app --env-file module/.env --host 0.0.0.0 --port 8001
+uvicorn module.app:app    --env-file module/.env --host 0.0.0.0 --port 8001   # detection
+uvicorn module.rawapp:app --env-file module/.env --host 0.0.0.0 --port 8011   # video
 ```
+
+The raw service is optional: skip it and detection works exactly the same, cameras
+just aren't playable. `GET :8011/health` shows `active_streams` / `max_streams`.
 
 Healthy startup looks like:
 
@@ -93,7 +113,10 @@ CENTRAL_URL=https://central.yourorg.internal \
 MODULE_TOKEN=<secret> \
 MODULE_ID=gpu-host-2 \
 MODULE_PUBLIC_URL=http://10.0.1.23:8001 \
+RAW_PUBLIC_URL=http://10.0.1.23:8011 \
 uvicorn module.app:app --host 0.0.0.0 --port 8001
+# plus, alongside it:
+uvicorn module.rawapp:app --host 0.0.0.0 --port 8011
 ```
 
 Two GPUs in one chassis? Run two instances, each seeing only its own card, and
@@ -123,7 +146,7 @@ TIMING a4e721eb f=960 | 15 pulled | decode=44ms pace=0ms detect=73ms post=1ms em
 | `decode` | Real decode cost. ~1-2ms = NVDEC; ~5-9ms = software |
 | `pace` | Sleep to hold real time. **`0ms` means the feed is behind and dropping frames** |
 | `detect` | Round-trip to the shared model: IPC + queue wait + preprocess + GPU |
-| `post` | This feed's track/rules/annotate/JPEG — only large when someone is watching |
+| `post` | This feed's track/rules/snapshots. No longer includes annotate/encode — that path is gone |
 | `gap` | Wall time between processed frames |
 
 `BATCH n=<k> predict=<t>ms` from the inference process is the one that tells you
@@ -156,15 +179,19 @@ python tests/test_ring.py         # shared-memory frame transport
 python tests/test_e2e.py          # coordinator + 2 workers + inference process
 python tests/test_wired.py        # this module registering with a live central
 python tests/test_batch_wait.py   # batch-window latency
+python tests/test_rawstream.py    # raw playback: source rate, tickets, stream cap
+python tests/test_preview.py      # probe + add-with-geometry
+python tests/bench_gpu.py         # measure fps_budget on this GPU
 ```
 
 They lower `imgsz`/`stride` for speed on a CPU box — raise them on the GPU host.
 
 ## Notes
 
-**No authentication on any endpoint.** The module serves its dashboard at `/` and
-`/feeds/*` accepts writes from anyone who can reach it. Don't put a module on an
-untrusted network as-is.
+**No authentication on any endpoint**, on either process. `/feeds/*` accepts writes
+from anyone who can reach it, and the raw service will decode any URL handed to it.
+Don't put either on an untrusted network as-is.
 
-`module/static/index.html` is the old single-box dashboard, kept for standalone
-debugging. The product UI is central's.
+The module has **no UI** — `GET /` on 8001 returns status JSON. The dashboard is
+central's; the old per-module video dashboard was deleted because it duplicated
+central's and could only ever show frames at detection rate.

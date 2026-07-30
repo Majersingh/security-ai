@@ -1,4 +1,14 @@
-"""Concurrent multi-feed orchestration.
+"""Concurrent multi-feed orchestration — detection only, no video.
+
+This module does **not** serve video. Playback lives in a separate process
+(``module/rawapp.py``) that decodes independently at the source frame rate, because
+display fps here was necessarily capped by *detection* fps. Removing it takes the
+annotate + JPEG-encode + base64 + viewer-throttle work out of the hot loop
+entirely, along with per-feed viewer queues and the view on/off control path.
+
+What remains for the UI is a single still frame for drawing zone/line geometry
+(``/feeds/probe``), which needs no running feed at all.
+
 
 Each :class:`Feed` owns its own :class:`FrameProcessor` — its tracker, rules,
 event log and annotator — but **not** a model. Detection is centralized: one
@@ -19,15 +29,12 @@ nothing here imports FastAPI.
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Awaitable, Callable, List, Optional, Protocol, Set, Tuple
-
-import cv2
 
 from config import Config
 from streaming import FrameProcessor
@@ -37,11 +44,6 @@ logger = logging.getLogger("operator_monitor")
 
 # on_update(payload) -> awaitable. Returns None; may raise if the client is gone.
 UpdateFn = Callable[[dict], Awaitable[None]]
-
-# Annotated stream frames are downscaled to this width before JPEG/base64
-# (display quality only; detection still runs at full resolution).
-_STREAM_MAX_WIDTH = 960
-_JPEG_QUALITY = 70
 
 _SENTINEL = object()
 
@@ -91,7 +93,6 @@ class Feed:
     def __init__(
         self, manager: "FeedManager", feed_id: str, source: FrameSource,
         cfg: Config, zone, line_start, line_end, name: str, kind: str,
-        emit_image: bool = False,
     ) -> None:
         self._manager = manager
         self.feed_id = feed_id
@@ -99,16 +100,6 @@ class Feed:
         self._cfg = cfg
         self._geom = (zone, line_start, line_end)
         self._stride = max(1, cfg.frame_stride)
-        # Stream feeds have no local copy of the video in the browser, so we send
-        # server-annotated JPEG frames; upload feeds send boxes-only JSON and the
-        # browser draws them over its own local <video>.
-        self._emit_image = emit_image
-        # Cap how often we encode+send a frame to viewers (display rate), so the
-        # browser stream stays light regardless of how fast detection runs.
-        self._viewer_interval = 1.0 / max(1.0, float(getattr(cfg, "viewer_max_fps", 12.0)))
-        # Selective viewing: video is only encoded/sent when this feed is being
-        # watched. Detection + events still run regardless.
-        self._viewing = False
         # The source pull gets its OWN thread, because `frames()` does the
         # real-time pacing `sleep` inside it — on the shared default executor that
         # sleeping thread competes with latency-critical work (the shared-memory
@@ -120,7 +111,6 @@ class Feed:
         self._proc: Optional[FrameProcessor] = None
         self._stop = asyncio.Event()
         self._on_update: Optional[UpdateFn] = None
-        self._subscribers: Set[asyncio.Queue] = set()
         self.info = FeedInfo(
             feed_id=feed_id, name=name, kind=kind,
             fps=round(source.fps, 2), width=source.width,
@@ -131,10 +121,6 @@ class Feed:
         """Request the feed to stop after the current frame."""
         self._stop.set()
 
-    def set_viewing(self, on: bool) -> None:
-        """Enable/disable video encoding for this feed (detection is unaffected)."""
-        self._viewing = bool(on)
-
     def set_geometry(self, zone, line_start, line_end) -> bool:
         """Update the detection zone/line on this feed at runtime (normalized
         coords). Returns False if the pipeline is not built yet."""
@@ -144,32 +130,11 @@ class Feed:
         self._proc.set_geometry(zone, line_start, line_end)
         return True
 
-    def subscribe(self) -> asyncio.Queue:
-        """Register a viewer; returns a **latest-only** queue (maxsize=1).
-
-        A slow viewer (e.g. over a bandwidth-limited tunnel) must never make the
-        browser play an ever-growing backlog — it should always jump to the most
-        recent frame. `_emit` drops the stale frame when a newer one arrives.
-        """
-        q: asyncio.Queue = asyncio.Queue(maxsize=1)
-        self._subscribers.add(q)
-        return q
-
-    def unsubscribe(self, q: asyncio.Queue) -> None:
-        self._subscribers.discard(q)
-
     async def _emit(self, payload: dict) -> bool:
-        """Fan a payload out to all subscribers (dropping the oldest if a viewer
-        lags) and to the direct driver. Returns False if the driver is gone."""
-        for q in list(self._subscribers):
-            try:
-                q.put_nowait(payload)
-            except asyncio.QueueFull:
-                try:  # viewer is slow -> drop its oldest to stay near-live
-                    q.get_nowait()
-                    q.put_nowait(payload)
-                except Exception:  # noqa: BLE001
-                    pass
+        """Hand a payload to the driver (the coordinator relay, or an upload client).
+
+        Returns False if the driver is gone, which stops the feed.
+        """
         if self._on_update is not None:
             try:
                 await self._on_update(payload)
@@ -209,7 +174,7 @@ class Feed:
             pace_accum = 0.0            # pacing-sleep ms since last processed frame
             pulled = 0                  # frames pulled (incl. skipped) since last processed
             last_proc_t = time.monotonic()
-            last_emit_t = 0.0           # last time we sent an annotated frame to viewers
+            last_emit_t = 0.0           # last progress/event payload sent
             while not self._stop.is_set():
                 item = await loop.run_in_executor(self._pull_pool, _next, gen)
                 decode_accum += getattr(self._source, "last_decode_ms", 0.0)
@@ -222,18 +187,8 @@ class Feed:
                 if raw_idx % self._stride:      # honour stride (raw index kept)
                     continue
 
-                # Detection runs on EVERY processed frame (for events/accuracy),
-                # but we only encode+send an annotated frame when the feed is
-                # being VIEWED, and then at most viewer_max_fps.
-                viewing = self._viewing or bool(self._subscribers)
-                t_now = time.monotonic()
-                want_image = (
-                    self._emit_image and viewing
-                    and (t_now - last_emit_t >= self._viewer_interval)
-                )
-
                 payload, (detect_ms, post_ms) = await self._manager.infer(
-                    self._proc, frame, raw_idx, annotated=want_image
+                    self._proc, frame, raw_idx
                 )
                 events = payload.get("events") or []
                 payload.update({
@@ -254,15 +209,16 @@ class Feed:
                 if events:
                     self._manager.publish_events(self.feed_id, self.info.name, events)
 
-                # Emit when: a display frame (image), OR it carries events (so the
-                # coordinator/global channel sees them even for unviewed feeds),
-                # OR it's a boxes-only feed.
-                t_em = time.monotonic()
+                # Emit on events, plus a slow heartbeat so the coordinator's
+                # frame_index/progress stay live without a payload per frame (at 80
+                # feeds that would be thousands of queue messages a second for
+                # numbers a dashboard reads once a second anyway).
+                t_now = time.monotonic()
+                t_em = t_now
                 alive = True
-                if want_image or events or not self._emit_image:
+                if events or (t_now - last_emit_t) >= 1.0:
                     alive = await self._emit(payload)
-                    if want_image:
-                        last_emit_t = t_now
+                    last_emit_t = t_now
                 emit_ms = (time.monotonic() - t_em) * 1000.0
 
                 now = time.monotonic()
@@ -333,7 +289,7 @@ class FeedManager:
 
     def create(
         self, source: FrameSource, cfg: Config, zone, line_start, line_end,
-        name: str, kind: str = "upload", emit_image: bool = False,
+        name: str, kind: str = "upload",
         feed_id: Optional[str] = None,
     ) -> Feed:
         """Register a new feed. Raises RuntimeError if the feed limit is hit.
@@ -350,7 +306,7 @@ class FeedManager:
         cfg.events_csv = base / "events.csv"
         cfg.snapshots_dir = base / "snapshots"
         feed = Feed(self, feed_id, source, cfg, zone, line_start, line_end,
-                    name, kind, emit_image=emit_image)
+                    name, kind)
         self._feeds[feed_id] = feed
         logger.info("Feed %s created (%s '%s'); %d active.", feed_id, kind, name, len(self._feeds))
         return feed
@@ -396,28 +352,25 @@ class FeedManager:
                 pass
 
     async def infer(
-        self, proc: FrameProcessor, frame, frame_index: int, annotated: bool = False,
+        self, proc: FrameProcessor, frame, frame_index: int,
     ) -> Tuple[dict, Tuple[float, float]]:
         """Process one frame; return ``(payload, (detect_ms, post_ms))``.
 
-        Two stages, deliberately split and timed separately because they have
-        completely different cures. ``detect_ms`` is the round-trip to the shared
-        model (IPC + queue wait + preprocess + GPU) — cured by imgsz, batch fill,
-        TensorRT. ``post_ms`` is this feed's own track/rules/annotate/encode —
-        cured by not encoding for unwatched feeds. Reporting them as one number
-        hid which of the two was actually costing anything.
+        Two stages, timed separately because they have different cures.
+        ``detect_ms`` is the round-trip to the shared model (IPC + queue wait +
+        preprocess + GPU) — cured by imgsz, batch fill, TensorRT. ``post_ms`` is
+        this feed's own track/rules/snapshot work.
 
-        ``annotated=False`` -> ``{boxes, events, w, h}`` (upload feeds; the browser
-        draws the boxes). ``annotated=True`` -> ``{image, events, w, h}`` with a
-        base64 JPEG of the annotated frame (stream feeds; no local video exists).
+        The payload is always plain data (``{boxes, events, w, h}``). No image is
+        produced here: video is a separate service, so nothing in this loop
+        annotates or JPEG-encodes.
         """
         t0 = time.monotonic()
         detections = await self._inferencer.infer(frame)      # awaits the batch
         t1 = time.monotonic()
         loop = asyncio.get_event_loop()
-        fn = self._infer_annotated if annotated else self._infer_boxes
         payload = await loop.run_in_executor(
-            self._post_pool, fn, proc, frame, frame_index, detections
+            self._post_pool, self._infer_boxes, proc, frame, frame_index, detections
         )
         t2 = time.monotonic()
         return payload, ((t1 - t0) * 1000.0, (t2 - t1) * 1000.0)
@@ -434,15 +387,3 @@ class FeedManager:
         boxes, events, w, h = proc.process_json(frame, frame_index, detections)
         return {"w": w, "h": h, "boxes": boxes, "events": [asdict(e) for e in events]}
 
-    @staticmethod
-    def _infer_annotated(proc: FrameProcessor, frame, frame_index: int, detections=None) -> dict:
-        annotated, events = proc.process(frame, frame_index, detections)
-        h, w = annotated.shape[:2]
-        cfg = proc._config
-        max_w = int(getattr(cfg, "viewer_max_width", _STREAM_MAX_WIDTH))
-        quality = int(getattr(cfg, "viewer_jpeg_quality", _JPEG_QUALITY))
-        if w > max_w:  # shrink the wire payload; detection ran at full res
-            annotated = cv2.resize(annotated, (max_w, int(h * (max_w / w))))
-        ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        image = base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
-        return {"w": w, "h": h, "image": image, "events": [asdict(e) for e in events]}

@@ -66,7 +66,7 @@ async def part_b() -> bool:
     mgr = FeedManager(cfg)                      # LocalInferencer, no IPC
     src = StreamURLSource(VIDEO, target_fps=1000, hw_decode=cfg.hw_decode).start()
     feed = mgr.create(src, cfg, None, None, None, name="local", kind="stream",
-                      emit_image=False)        # boxes-only payloads
+                      )        # boxes-only payloads
     seen = {"frame": 0, "done": 0, "error": 0}
     boxes = 0
 

@@ -3,8 +3,9 @@
 Monitors **live camera streams** (RTSP / HLS / HTTP) of control-room operators
 and detects **mobile phone usage on duty**, plus optional **zone-intrusion** and
 **line-crossing** rules drawn on each stream. It detects and tracks people,
-associates phones with tracked operators, and streams annotated frames + a live
-events feed to a web dashboard. Many streams run concurrently on a single GPU.
+associates phones with tracked operators, and reports violations to a central
+dashboard with a live events feed and a video wall. Many streams run concurrently on
+a single GPU, and capacity grows by adding GPU hosts.
 
 Artefacts kept: per-feed violation snapshots + `events.csv` under
 `module/output/<feed_id>/`, and — when central is running — every violation in
@@ -25,18 +26,19 @@ cameras. Scale by deploying another module — it registers itself with central.
 Inside a module the pipeline is one responsibility per file:
 
 ```
-app.py          FastAPI: /feeds/* REST + WebSocket transport (stream-only)
+app.py          FastAPI: /feeds/* — detection control. Serves NO video.
+rawapp.py       SEPARATE process: raw playback at source frame rate
+rawstream.py    the raw decode/encode loop + ticket store (no model)
 reporting.py    register + heartbeat + durable event spool -> central
 core/
 sources.py      StreamURLSource: PyAV decode of RTSP/HLS/HTTP (NVDEC when available)
 feeds.py        Feed + FeedManager: concurrent feeds, per-process registry
 workers.py      WorkerPool: coordinator + N worker processes (the CPU-bound work)
 inference.py    ONE process owns the GPU: shared model, batching, shared-mem ring
-streaming.py    FrameProcessor: per-frame track -> rules -> annotate (no model)
+streaming.py    FrameProcessor: per-frame track -> rules (no model, renders nothing)
 tracker.py      Tracker:        routes tracked detections to persons / phones
 behavior.py     BehaviorEngine + BehaviorRule + PhoneUsageRule / Zone / Line
                                 business logic, debounced into episodes
-annotator.py    Annotator:      draws green/blue/red boxes + labels
 events.py       EventLog + SnapshotManager: CSV + JPEG persistence
 config.py       Config:         every tunable value (typed dataclass)
 utils.py        logging, geometry (IoU/containment), timestamp helpers
@@ -97,14 +99,16 @@ runs ~50x slower.
 Start an analysis module (standalone — no central needed):
 
 ```bash
-uvicorn module.app:app --host 0.0.0.0 --port 8001
+uvicorn module.app:app    --host 0.0.0.0 --port 8001   # detection
+uvicorn module.rawapp:app --host 0.0.0.0 --port 8011   # video (optional)
 ```
 
-Or run the full fleet — central plus one or more modules:
+Or the full fleet — central plus one or more module hosts:
 
 ```bash
-uvicorn central.app:app --env-file central/.env --host 0.0.0.0 --port 9000
-uvicorn module.app:app  --env-file module/.env  --host 0.0.0.0 --port 8001
+uvicorn central.app:app   --env-file central/.env --port 9000   # dashboard + registry
+uvicorn module.app:app    --env-file module/.env  --port 8001   # detection
+uvicorn module.rawapp:app --env-file module/.env  --port 8011   # video
 ```
 
 With central, add cameras on **its** dashboard (port 9000) and it places them on a
@@ -115,8 +119,9 @@ and click **Add Stream**. Each stream runs as its own feed; draw a **line** or
 violations appear in the events panel and are saved as per-feed snapshots +
 `events.csv` under `output/<feed_id>/`. Nothing else is stored.
 
-REST/WS API: `GET /feeds`, `POST /feeds/stream {url}`, `POST /feeds/{id}/stop`,
-`POST /feeds/{id}/geometry`, `WS /feeds/{id}/subscribe`.
+Module API: `GET /feeds`, `POST /feeds/stream {url}`, `POST /feeds/{id}/stop`,
+`POST /feeds/{id}/geometry`, `POST /feeds/probe`, `WS /events`.
+Raw video service: `POST /stream/raw/ticket`, `WS /stream/raw?ticket=…`.
 
 ---
 
@@ -131,7 +136,8 @@ output/<feed_id>/
     phone_000123.jpg     # JPEG evidence, named <prefix>_<frame>.jpg
 ```
 
-Annotated frames are streamed to the dashboard live; **no video is stored**.
+Live video is played by the separate raw-video service at the source frame rate;
+**no video is stored**. Detection writes only snapshots and event rows.
 
 `events.csv` columns:
 
@@ -167,14 +173,16 @@ security-ai/
 ## How it works
 
 A stream URL is opened by `StreamURLSource` (PyAV) and processed frame by frame
-through `FrameProcessor` (`Tracker` → `BehaviorEngine` → `Annotator`). Each stream
-is a `Feed`; `FeedManager` runs many feeds concurrently. Detection is **centralized
-in one process that owns the GPU** and batches frames from every feed together, so
-there is one CUDA context and one copy of the weights; identity tracking stays
-per-feed. Live streams **drop stale frames** when they fall behind real time, and
-**auto-reconnect**. The browser subscribes over a WebSocket and receives
-annotated JPEG frames + events; drawn zone/line geometry is pushed back with
-`POST /feeds/{id}/geometry` and applied on the next frame.
+through `FrameProcessor` (`Tracker` → `BehaviorEngine`). Each stream is a `Feed`;
+`FeedManager` runs many concurrently. Detection is **centralized in one process that
+owns the GPU** and batches frames from every feed, so there is one CUDA context and
+one copy of the weights; identity tracking stays per-feed. Live streams **drop stale
+frames** when they fall behind real time, and **auto-reconnect**.
+
+The detection service renders nothing. **Video is a separate process** (`rawapp.py`)
+with its own decode at the source frame rate, because display fps was otherwise
+capped by detection fps. The one image detection still produces is the still frame
+from `POST /feeds/probe`, used to draw zone/line geometry before a camera starts.
 
 See `docs/ARCHITECTURE.md` for the full design.
 
@@ -228,6 +236,8 @@ per feed (e.g. `inference_imgsz`).
 | `max_feeds` | 80 | Admission limit on concurrent feeds (not a VRAM ceiling) |
 | `num_workers` | physical cores (max 8) | Worker processes for decode/track/annotate; 0 = all in-process |
 | `cv_threads` / `torch_threads` | 1 | Per-process thread caps, so N processes don't oversubscribe the CPU |
+| `fps_budget` | 0 | Measured detection fps of this GPU; 0 makes central count slots and overcommit |
+| `raw_max_streams` | 16 | Concurrent raw video decodes (one per watched tile) |
 | `hw_decode` | True | NVDEC hardware decode, with automatic software fallback |
 | `batch_max_size` / `batch_max_wait_ms` | 16 / 12 | Batching in the single inference process |
 

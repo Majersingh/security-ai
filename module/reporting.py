@@ -135,6 +135,10 @@ class CentralReporter:
         self.public_url = (
             public_url or os.environ.get("MODULE_PUBLIC_URL") or ""
         ).rstrip("/")
+        # Where the SEPARATE raw video service is reachable. Advertised so central
+        # can hand browsers a raw-playback URL; blank means this host offers
+        # analysed video only and the wall falls back to the detection stream.
+        self.raw_url = (os.environ.get("RAW_PUBLIC_URL") or "").rstrip("/")
         self.token = token or os.environ.get("MODULE_TOKEN") or ""
         self._status = status_provider or (lambda: {"active_feeds": 0, "feeds": []})
         # Spool file is namespaced by module id. Two module instances started from
@@ -208,6 +212,7 @@ class CentralReporter:
             "id": self.module_id,
             "url": self.public_url,
             "gpu": self._gpu_name(),
+            "raw_url": self.raw_url,
             "max_feeds": int(getattr(self._cfg, "max_feeds", 0)),
             "fps_budget": float(getattr(self._cfg, "fps_budget", 0) or 0),
             "version": "module/1",

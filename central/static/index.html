@@ -1,7 +1,10 @@
 <title>CCTV Monitoring — Fleet</title>
 <style>
  body{font:14px system-ui,sans-serif;margin:0;padding:20px;background:#0f1115;color:#e6e6e6}
- h1{font-size:18px;margin:0 0 16px} h2{font-size:14px;margin:20px 0 8px;color:#9aa}
+ h1{font-size:18px;margin:0 0 16px;display:flex;align-items:center;gap:14px}
+ h1 a{font-size:13px;font-weight:400;color:#6b8dd6;text-decoration:none;
+      border:1px solid #2b3040;border-radius:6px;padding:5px 10px;background:#171a21}
+ h1 a:hover{border-color:#1f6feb;color:#8aa9e8} h2{font-size:14px;margin:20px 0 8px;color:#9aa}
  table{border-collapse:collapse;width:100%;margin-bottom:8px}
  th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #232733;font-size:13px}
  th{color:#7d8799;font-weight:600}
@@ -24,7 +27,9 @@
  button.on{background:#1f6feb;border-color:#1f6feb}
  .tile .st{font-size:11px;color:#6b7280;margin-top:4px}
 </style>
-<h1>CCTV Operator Monitoring — Fleet</h1>
+<h1>CCTV Operator Monitoring — Fleet
+  <a href="/wall" id="wall-link">Video wall →</a>
+</h1>
 <div class="cards" id="cards"></div>
 <h2>Add camera</h2>
 <div class="row">
@@ -57,7 +62,8 @@ can draw a zone or tripwire before it starts.">
     </div>
   </div>
 </div>
-<h2>Live view</h2>
+<h2>Live view <a href="/wall" style="font-size:12px;font-weight:400;color:#6b8dd6">
+  open the full video wall →</a></h2>
 <div id="tiles"><span class="dim">Click “view” on a camera below. Video streams
   straight from its module — it never passes through central.</span></div>
 <h2>Modules</h2><table id="mods"></table>
@@ -79,8 +85,16 @@ function tbl(el, cols, rows){
 
 // A ws:// URL cannot be navigated to — it only works from JavaScript. So we open
 // it here and paint frames, rather than rendering it as a link.
-function toggleView(camId, name, wsUrl){
+async function toggleView(camId, name){
   if (tiles[camId]) { closeView(camId); return; }
+  // Ask central for a raw-playback URL; the detection module serves no video.
+  let wsUrl = null;
+  try {
+    const r = await j(`/api/cameras/${camId}/raw`, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({width:960})});
+    wsUrl = r.ws_url;
+    if (!wsUrl) { alert(r.error || 'no raw video service on that module'); return; }
+  } catch(e){ alert('could not start video'); return; }
   const box = document.createElement('div');
   box.className = 'tile'; box.id = 'tile-'+camId;
   box.innerHTML = `<h3><span>${name}</span>
@@ -158,10 +172,12 @@ async function refresh(){
           ? esc(c.module_id)+(c.module_online?'':' <span class="off">(down)</span>')
           : '<span class="dim">unplaced</span>')
         + (c.pinned_module?` <span class="dim">📌${esc(c.pinned_module)}</span>`:'')],
-      ['View',c=>c.video_url
+      ['View',c=>c.playable
         ? `<button class="ghost act-view" data-id="${esc(c.id)}" data-name="${esc(c.name)}"
-            data-ws="${esc(c.video_url)}">${tiles[c.id]?'stop':'view'}</button>`
-        : '<span class="dim">—</span>'],
+            >${tiles[c.id]?'stop':'view'}</button>`
+        : `<span class="dim" title="${esc(c.playable_reason||'')}">${
+             (c.playable_reason||'').includes('raw video service')
+               ? 'video service off' : '—'}</span>`],
       ['',c=>`<button class="act-del" data-id="${esc(c.id)}">remove</button>`]],
      cams.cameras);
   tbl(document.getElementById('evs'),
@@ -330,7 +346,7 @@ $('prev-canvas').onclick = (e) => {
 
 document.addEventListener('click', (e) => {
   const v = e.target.closest('.act-view');
-  if (v) { toggleView(v.dataset.id, v.dataset.name, v.dataset.ws); return; }
+  if (v) { toggleView(v.dataset.id, v.dataset.name); return; }
   const d = e.target.closest('.act-del');
   if (d) { del(d.dataset.id); }
 });

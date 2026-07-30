@@ -2,15 +2,18 @@
 
 The system processes **live stream URLs** (RTSP / HLS / HTTP). Each stream is a
 background :class:`feeds.Feed` that decodes with PyAV (NVDEC when available), gets
-its detections from the one shared inference process, and broadcasts annotated
-frames + events to any viewers.
+its detections from the one shared inference process, and reports violations.
 
 Endpoints
 ---------
 * ``GET  /feeds``                  -- snapshot of all active feeds.
 * ``POST /feeds/stream {url}``     -- start a feed from a stream URL.
 * ``POST /feeds/{id}/stop``        -- stop a feed.
-* ``WS   /feeds/{id}/subscribe``   -- watch a feed's annotated frames + events.
+* ``POST /feeds/probe``            -- one still frame, for drawing zone/line.
+* ``WS   /events``                 -- violations from every feed on this module.
+
+This service serves NO video. Playback is a separate process (module/rawapp.py)
+that decodes at the source frame rate; display here was capped by detection fps.
 
 Nothing is stored except event snapshots and per-feed ``events.csv``.
 Only the transport lives here; all CV logic is reused from ``src/``.
@@ -31,8 +34,7 @@ sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(ROOT))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
-from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
-from fastapi.staticfiles import StaticFiles  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
 
 from contextlib import asynccontextmanager  # noqa: E402
 
@@ -51,8 +53,6 @@ logger = setup_logging("INFO")
 # Ultralytics logs a per-inference "'half' is deprecated" warning that floods the
 # console at scale; we intentionally use half=True on CUDA, so quiet it.
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
-
-STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def _log_hardware() -> None:
@@ -220,7 +220,7 @@ async def set_feed_geometry(feed_id: str, payload: dict) -> JSONResponse:
     """Set/clear a running feed's detection zone/line (normalized coords).
 
     Sent by the UI after the user draws on the live stream. Takes effect on the
-    next frame; annotated frames then show the zone/line.
+    next frame, so events start honouring it immediately.
     """
     zone, line_start, line_end = _parse_geometry(payload)
     pool = app.state.pool
@@ -295,13 +295,13 @@ async def probe_stream(payload: dict) -> JSONResponse:
                             status_code=502)
 
     fh, fw = frame.shape[:2]
-    max_w = int(getattr(cfg, "viewer_max_width", 640))
+    max_w = int(getattr(cfg, "probe_max_width", 960))
     shown = frame
     if fw > max_w:                     # shrink the wire payload only
         shown = cv2.resize(frame, (max_w, int(fh * (max_w / fw))))
     ok, buf = cv2.imencode(".jpg", shown,
                            [cv2.IMWRITE_JPEG_QUALITY,
-                            int(getattr(cfg, "viewer_jpeg_quality", 70))])
+                            int(getattr(cfg, "probe_jpeg_quality", 75))])
     if not ok:
         return JSONResponse({"error": "could not encode preview frame"},
                             status_code=500)
@@ -317,8 +317,8 @@ async def add_stream(payload: dict) -> JSONResponse:
     """Start a background feed from a live stream URL (RTSP / HLS / HTTP).
 
     In coordinator mode the feed is assigned to a worker process; viewers watch
-    via ``WS /feeds/{id}/subscribe``. Nothing is stored except event snapshots +
-    ``events.csv``.
+    Violations are reported to central and written to ``events.csv``; snapshots are
+    the only images kept. For live viewing, use the raw video service.
     """
     url = (payload.get("url") or "").strip() if isinstance(payload, dict) else ""
     name = (payload.get("name") if isinstance(payload, dict) else None) or url
@@ -360,7 +360,7 @@ async def add_stream(payload: dict) -> JSONResponse:
         return JSONResponse({"error": f"could not open stream: {exc}"}, status_code=400)
     try:
         feed = mgr.create(source, cfg, zone, line_start, line_end,
-                          name=name, kind="stream", emit_image=True)
+                          name=name, kind="stream")
     except RuntimeError as exc:  # feed limit reached
         source.close()
         return JSONResponse({"error": str(exc)}, status_code=429)
@@ -371,73 +371,6 @@ async def add_stream(payload: dict) -> JSONResponse:
         "feed_id": feed.feed_id, "name": name,
         "width": source.width, "height": source.height, "fps": round(source.fps, 2),
     })
-
-
-@app.websocket("/feeds/{feed_id}/subscribe")
-async def subscribe_feed(websocket: WebSocket, feed_id: str) -> None:
-    """Attach a viewer to a running feed and relay its result payloads."""
-    await websocket.accept()
-    pool = websocket.app.state.pool
-
-    if pool is not None:
-        info = pool.get_info(feed_id)
-        if info is None:
-            await websocket.send_json({"type": "error", "message": "unknown or finished feed"})
-            await websocket.close()
-            return
-        queue = pool.subscribe(feed_id)
-        try:
-            await websocket.send_json({
-                "type": "meta", "feed_id": feed_id, "kind": info.get("kind", "stream"),
-                "fps": info.get("fps", 0.0), "total_frames": info.get("total_frames", 0),
-                "width": info.get("width", 0), "height": info.get("height", 0),
-            })
-            while True:
-                payload = await queue.get()
-                await websocket.send_json(payload)
-                if payload.get("type") in ("done", "error"):
-                    break
-        except WebSocketDisconnect:
-            logger.info("Viewer left feed %s.", feed_id)
-        except Exception:  # noqa: BLE001
-            logger.exception("subscribe relay failed for feed %s", feed_id)
-        finally:
-            pool.unsubscribe(feed_id, queue)
-            try:
-                await websocket.close()
-            except Exception:
-                pass
-        return
-
-    # ---- in-process mode ----
-    mgr: FeedManager = websocket.app.state.feeds
-    feed = mgr.get(feed_id)
-    if feed is None:
-        await websocket.send_json({"type": "error", "message": "unknown or finished feed"})
-        await websocket.close()
-        return
-    queue = feed.subscribe()
-    try:
-        await websocket.send_json({
-            "type": "meta", "feed_id": feed_id, "kind": feed.info.kind,
-            "fps": feed.info.fps, "total_frames": feed.info.total_frames,
-            "width": feed.info.width, "height": feed.info.height,
-        })
-        while True:
-            payload = await queue.get()
-            await websocket.send_json(payload)
-            if payload.get("type") in ("done", "error"):
-                break
-    except WebSocketDisconnect:
-        logger.info("Viewer left feed %s.", feed_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("subscribe relay failed for feed %s", feed_id)
-    finally:
-        feed.unsubscribe(queue)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
 
 
 @app.websocket("/events")
@@ -464,11 +397,20 @@ async def events_ws(websocket: WebSocket) -> None:
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    """Serve the dashboard with no-store so browsers never run a stale copy
-    (we iterate on the UI a lot; caching kept biting)."""
-    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+async def index() -> dict:
+    """Status only. This service has no UI and serves no video.
 
-
-# Serve remaining static assets at "/".
-app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    The dashboard lives in the central app; video playback is a separate process
+    (``module/rawapp.py``). What used to be served here was a per-module video
+    dashboard, which duplicated central's and could only ever show frames at
+    detection rate.
+    """
+    mgr = app.state.pool or app.state.feeds
+    return {
+        "service": "detection",
+        "active_feeds": mgr.count(),
+        "max_feeds": mgr.max_feeds,
+        "reporting_to": getattr(app.state.reporter, "central", "") or None,
+        "endpoints": ["GET /feeds", "POST /feeds/stream", "POST /feeds/{id}/stop",
+                      "POST /feeds/{id}/geometry", "POST /feeds/probe", "WS /events"],
+    }

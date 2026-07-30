@@ -1,8 +1,8 @@
 """Per-frame processing core for the live-stream pipeline.
 
-:class:`FrameProcessor` wraps tracker / behaviour engine / annotator and processes
-ONE frame at a time, returning either an annotated frame or plain detection data
-plus any events that fired.
+:class:`FrameProcessor` wraps tracker / behaviour engine and processes ONE frame at
+a time, returning detection data plus any events that fired. It renders nothing:
+video is a separate service, so there is no annotated-frame path here.
 
 It does **not** own a model. Detections are supplied by the shared model in the
 inference process (see :mod:`inference`); what lives here is the per-feed state
@@ -21,7 +21,6 @@ import numpy as np
 
 import supervision as sv
 
-from annotator import Annotator
 from behavior import BehaviorEngine, build_rules
 from config import Config
 from events import Event, EventLog, SnapshotManager
@@ -60,7 +59,6 @@ class FrameProcessor:
         self._tracker = Tracker(config)
         self._event_log = EventLog(config)
         self._snapshots = SnapshotManager(config)
-        self._annotator = Annotator(config)
         self._fps = fps
         self._processing_fps = processing_fps
         self._norm_zone = zone_polygon
@@ -123,13 +121,6 @@ class FrameProcessor:
         result = self._engine.process(persons, phones, frame_index, frame)
         new_events = self._event_log.events[before:]
         return persons, phones, result, new_events
-
-    def process(self, frame: np.ndarray, frame_index: int, detections=None) -> Tuple[np.ndarray, List[Event]]:
-        """Run the pipeline and return an ANNOTATED frame (used for stream feeds)."""
-        persons, phones, result, new_events = self._run(frame, frame_index, detections)
-        annotated = self._annotator.annotate(frame, persons, phones, result)
-        self._engine.draw_overlays(annotated)  # zone/line overlays
-        return annotated, new_events
 
     def process_json(self, frame: np.ndarray, frame_index: int, detections=None):
         """Run the pipeline and return DETECTIONS as plain data (no image).

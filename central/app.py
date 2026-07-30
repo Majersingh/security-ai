@@ -5,7 +5,8 @@ registry and health, placement, the event store, and the dashboard.
 
 It never decodes a frame, never loads a model, and needs no GPU — which is why
 ``central/requirements.txt`` shares nothing with ``module/requirements.txt``.
-Video goes straight from a module to the browser; central only hands out the URL.
+Video goes straight from a module's raw-video service to the browser; central only
+hands out a short-lived URL. The detection module serves no video at all.
 
 Scaling: deploy another module. It registers itself, central sees the new
 headroom, and cameras start landing on it. Nothing here is edited.
@@ -204,6 +205,57 @@ async def probe_camera(payload: dict) -> JSONResponse:
     return JSONResponse({"error": f"could not preview stream: {last}"}, status_code=502)
 
 
+@app.post("/api/cameras/{cam_id}/raw")
+async def camera_raw_url(cam_id: str, payload: Optional[dict] = None) -> JSONResponse:
+    """WebSocket URL for RAW video of this camera — independent of detection.
+
+    Smooth playback at the source frame rate, because it does not wait on the
+    model. Costs one extra decode on the module while a viewer is watching, which
+    is why it is requested per camera rather than opened for everything.
+
+    The RTSP URL never reaches the browser: the module issues a short-lived ticket
+    and we hand back only that.
+    """
+    store: Store = app.state.store
+    cam = store.camera(cam_id)
+    if cam is None:
+        raise HTTPException(404, "unknown camera")
+
+    # Prefer the module already running this camera (it has a proven route to it);
+    # otherwise any online module can decode it.
+    mods = store.modules(STALE_AFTER)
+    owner = next((m for m in mods if m["id"] == cam.get("module_id") and m["online"]),
+                 None)
+    candidates = [owner] if owner else [m for m in mods if m["online"]]
+    if not candidates:
+        return JSONResponse({"error": "no module is online to play this stream"},
+                            status_code=503)
+
+    body = payload or {}
+    fps = int(body.get("fps") or 0)
+    width = int(body.get("width") or 0)
+    last = ""
+    for mod in candidates:
+        # Raw video is served by a SEPARATE process on the host, advertised at
+        # registration. Without it this host offers analysed video only.
+        raw_base = mod.get("raw_url")
+        if not raw_base:
+            last = f"module '{mod['id']}' advertises no raw video service"
+            continue
+        try:
+            client = ModuleClient(raw_base)
+            res = await client.raw_ticket(cam["url"])
+            return JSONResponse({
+                "ws_url": client.raw_ws_url(res["ticket"], fps, width),
+                "module_id": mod["id"], "expires_in": res.get("expires_in"),
+            })
+        except (ModuleError, KeyError) as exc:
+            last = str(exc)
+            logger.warning("raw ticket via %s failed: %s", mod["id"], exc)
+    return JSONResponse({"error": f"could not start raw stream: {last}"},
+                        status_code=502)
+
+
 @app.post("/api/cameras")
 async def add_camera(payload: dict) -> dict:
     """Register a camera and place it on a module with headroom."""
@@ -224,7 +276,12 @@ async def add_camera(payload: dict) -> dict:
 
 @app.get("/api/cameras")
 async def list_cameras() -> dict:
-    """Every camera, with its module and the direct video URL for the browser."""
+    """Every camera with its module and health.
+
+    No video URL here: the detection module serves no video. Live playback is
+    requested per camera via ``POST /api/cameras/{id}/raw``, which returns a
+    WebSocket on the module host's separate raw-video service.
+    """
     store: Store = app.state.store
     mods = {m["id"]: m for m in store.modules(STALE_AFTER)}
     out = []
@@ -232,10 +289,21 @@ async def list_cameras() -> dict:
         row = dict(cam)
         mod = mods.get(cam["module_id"]) if cam["module_id"] else None
         row["module_online"] = bool(mod and mod["online"])
-        row["video_url"] = (
-            ModuleClient(mod["url"]).video_url(cam["feed_id"])
-            if mod and cam.get("feed_id") else None
-        )
+        # Can this camera be played, and if not, WHY? The reason is surfaced in the
+        # UI: "not playable" with no explanation sends people hunting through logs
+        # for a missing RAW_PUBLIC_URL.
+        if mod is None:
+            row["playable"], row["playable_reason"] = False, "not placed on a module yet"
+        elif not mod["online"]:
+            row["playable"], row["playable_reason"] = False, f"module '{mod['id']}' is offline"
+        elif not mod.get("raw_url"):
+            row["playable"] = False
+            row["playable_reason"] = (
+                f"raw video service not running on '{mod['id']}' — start it with "
+                f"`uvicorn module.rawapp:app --port 8011` and set RAW_PUBLIC_URL"
+            )
+        else:
+            row["playable"], row["playable_reason"] = True, None
         out.append(row)
     return {"cameras": out}
 
@@ -296,6 +364,20 @@ async def fleet() -> dict:
 @app.get("/api/events")
 async def list_events(limit: int = 100, camera_id: Optional[str] = None) -> dict:
     return {"events": app.state.store.recent_events(limit, camera_id)}
+
+
+@app.get("/wall")
+async def wall():
+    """Video-wall page: pick cameras, see live tiles in a responsive grid.
+
+    Note browsers cannot play RTSP directly — no <video> or MSE support for it — so
+    tiles use the module's frame WebSocket, the same transport the dashboard uses.
+    Each tile connects straight to its owning module; central only serves this page.
+    """
+    page = STATIC_DIR / "wall.html"
+    if not page.exists():
+        raise HTTPException(404, "wall page not built")
+    return FileResponse(page, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/")
