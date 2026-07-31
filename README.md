@@ -11,7 +11,9 @@ Artefacts kept: per-feed violation snapshots + `events.csv` under
 `module/output/<feed_id>/`, and — when central is running — every violation in
 central's database. Video itself is **never stored**.
 
-> **Behaviours implemented:** phone-usage, zone-intrusion, line-crossing.
+> **Behaviours implemented:** phone-usage, zone-intrusion, line-crossing,
+> crowd-gathering, and helmet compliance (the last needs a PPE-trained model —
+> see [PPE: helmet compliance](#ppe-helmet-compliance)).
 > Sleeping / gaze / absence detection are intentionally **not** implemented yet
 > (see [Future Improvements](#future-improvements)).
 
@@ -34,9 +36,10 @@ feeds.py        Feed + FeedManager: concurrent feeds, per-process registry
 workers.py      WorkerPool: coordinator + N worker processes (the CPU-bound work)
 inference.py    ONE process owns the GPU: shared model, batching, shared-mem ring
 streaming.py    FrameProcessor: per-frame track -> rules (no model, renders nothing)
-tracker.py      Tracker:        routes tracked detections to persons / phones
-behavior.py     BehaviorEngine + BehaviorRule + PhoneUsageRule / Zone / Line
-                                business logic, debounced into episodes
+tracker.py      Tracker:        routes tracked detections to persons + {class: objects}
+behavior.py     BehaviorEngine + BehaviorRule + PhoneUsage / Zone / Line /
+                                Crowd / HelmetCompliance — business logic,
+                                debounced into episodes
 events.py       EventLog + SnapshotManager: CSV + JPEG persistence
 config.py       Config:         every tunable value (typed dataclass)
 utils.py        logging, geometry (IoU/containment), timestamp helpers
@@ -153,12 +156,15 @@ security-ai/
                     SETUP.md, .env.example, requirements.txt   (no GPU, no torch)
   module/           app.py, reporting.py, static/
                     core/     the CV pipeline (config, feeds, inference, sources,
-                              streaming, behavior, tracker, annotator, events, utils)
+                              streaming, behavior, tracker, events, workers, utils)
                     models/   yolo11n.pt        (auto-downloaded)
                     output/   <feed_id>/{events.csv, snapshots/}
-                    input/    sample media
                     SETUP.md, .env.example, requirements.txt
-  tests/            ring, e2e, central contract, wired module, batch window
+  streamer/         video-only deployable (no GPU, no torch)
+  core/             shared by the deployables: stream decode + process helpers
+  training/         offline: build a PPE dataset and fine-tune (see its README)
+  tests/            ring, e2e, central contract, wired module, batch window,
+                    crowd + PPE rules
   docs/             ARCHITECTURE.md
   README.md
 ```
@@ -211,6 +217,122 @@ On each connected stream tile, use the **Line / Zone / Clear** tools:
    the feed rebuilds its rules on the next frame and the annotated stream then
    shows the zone/line and fires intrusion / crossing events.
 
+## Crowd gathering
+
+Alerts when **more than `crowd_max_persons` people stand close together for
+`crowd_hold_seconds`**. Enabled by default (`crowd_enabled`) and needs no
+geometry and no extra model — it is pure clustering over the person boxes the
+detector already produces, so it costs nothing on the GPU.
+
+- **How many is a crowd** — `crowd_max_persons` (default 3) is the *allowed*
+  group size: up to 3 together is fine, the 4th triggers. Raise it in busy
+  areas, lower it where any huddle matters.
+- **How close is "together"** — `crowd_proximity_factor` (default 0.6) measures
+  the gap between two people as a fraction of **their own box height**, not in
+  pixels. Someone near the camera is simply bigger, so a fixed pixel threshold
+  would group distant strangers while missing an adjacent pair; scaling by
+  height makes one setting work across the whole frame and across resolutions.
+- **Groups are transitive** — A is with B, B is with C, so all three are one
+  gathering. That is what a queue or a huddle actually looks like, and it means
+  a spread-out line of people counts as one group rather than several pairs.
+- **It has its own clock** — `crowd_hold_seconds` (3.0) and
+  `crowd_clear_seconds` (3.0) override the global `violation_start/end_seconds`,
+  which are tuned for phone usage at 1.0 s. People pass each other constantly;
+  without a longer hold every corridor crossing would fire.
+
+Every member of an over-size group is logged individually, so a group of 5
+produces 5 `Crowd Gathering` rows in `events.csv` (one per `Person ID`) — the
+same shape as zone intrusion. Snapshots are cropped to the **whole group**, not
+the individual, since a photo of one person tells you nothing about a gathering.
+
+Any rule may now declare its own debounce timescale via `BehaviorRule.start_seconds`
+/ `end_seconds`; rules that don't (phone, zone) keep using the global values.
+
+## PPE: helmet compliance
+
+**Off by default, because it needs a model you have to train.** COCO has no
+helmet class, so `yolo11n.pt` can never fire this rule. Enable it only once
+`model_path` points at a PPE-trained model, then set `ppe_enabled = True` and
+`helmet_class_id` to that model's helmet class id.
+
+> **Train one model, not two.** A PPE model that only knows `person` + `helmet`
+> silently kills phone detection, and running a second model doubles GPU cost on
+> a box already budgeted at ~143 fps. Fine-tune a single model that covers
+> person, phone and helmet, and set the three `*_class_id` knobs to match it.
+
+**How it decides.** For each person, the top `ppe_head_region` (35%) of the box —
+extended upward by `ppe_head_margin` (10%), because detectors clip the box at the
+scalp while a helmet sits above it — is the search region. What happens there
+depends on which classes your model has.
+
+### Train a `head` class (recommended)
+
+Label a box on **every visible head** — covered or bare, front, back or side —
+and a box on **every helmet**, wherever it is. Set `head_class_id` and the rule
+compares their positions:
+
+| Helmet is... | Result |
+|---|---|
+| On the detected head | Compliant |
+| In the hand, at the chest, on the floor | Not worn → violation |
+
+Two reasons this beats having no head class:
+
+- **It can tell worn from carried.** Without a head box the rule must guess the
+  head from the person box, and that guess (top 35%) reaches the chest on a
+  standing worker — so a helmet held in the hand reads as compliance. Matching
+  against the *detected* head box cannot be fooled that way. Both behaviours are
+  pinned in `tests/test_ppe.py`.
+- **Labelling gets easier, not harder.** Draw every head, draw every helmet. No
+  judgement call about whether something counts as covered, so two people
+  labelling the same footage produce the same file. Compliance is decided by the
+  rule at runtime, which also means a policy change (do cloth caps count?) is a
+  code change, not a relabelling job.
+
+It also gives you a denominator: every visible head is counted, so you can report
+"14 of 16 wearing helmets" rather than just a violation count.
+
+**The alert is still an absence.** It fires because a helmet was *not* found on
+that head, so a helmet the model fails to see accuses a compliant worker. That is
+what the suppressors below are for, and they apply in both modes.
+
+### Without a head class — the coarse fallback
+
+With no `head_class_id`, a *missing* helmet is the accusation. A person facing
+away, occluded by machinery, cropped by the frame edge or simply too far away
+produces exactly the same evidence as a bare head. The suppressors below are
+therefore part of the detector, not fine-tuning — each disables one of those
+failure modes, and a person who fails any of them is **skipped, not marked
+compliant** (the rule is saying "cannot judge"):
+
+| Knob | Default | Suppresses |
+|---|---|---|
+| `ppe_min_person_height` | 120 px | Too far away — at that size a helmet is a few pixels, so absence proves nothing |
+| `ppe_min_person_conf` | 0.5 | Weak person detections, which are often not people |
+| `ppe_edge_margin` | 8 px | People cropped by the top frame edge, whose head is out of shot |
+| `ppe_hold_seconds` | 5.0 | **The big one** — the helmet must be absent *continuously*, so motion blur or a passing forklift cannot fire an event |
+
+Expect to tune these against your own footage before trusting the output; the
+defaults are conservative (they prefer missing a violation to inventing one).
+
+Other knobs: `ppe_head_region`, `ppe_head_margin`, `ppe_clear_seconds` (2.0, how
+long a helmet must be seen before the episode closes). Events log as
+`No Helmet (PPE)` either way. The module logs at startup whether it is matching
+against detected heads or falling back to the coarse region.
+
+### Adding another PPE item (vest, mask)
+
+The plumbing is class-generic, so it is a config entry plus a rule:
+
+1. Add the class to `Config.object_class_names()` — that one method decides what
+   the detector keeps (`detect_class_ids()`), how the behaviour layer keys
+   detections, and what name the browser sees.
+2. Write a `BehaviorRule` subclass and register it in `build_rules()`.
+
+`Tracker.route()` returns `(persons, {class_id: detections})`, so no routing,
+inference or wire code changes. Note that masks are small objects and will need
+`inference_imgsz` 1280+ — the same problem phones already have.
+
 ## Tuning knobs (where to change behaviour)
 
 **When is a "Mobile Phone Usage" event logged?**
@@ -228,8 +350,17 @@ per feed (e.g. `inference_imgsz`).
 | `violation_end_seconds` | 1.5 | Gap of no-phone that ends an episode |
 | `confidence_threshold` | 0.25 | Min detection score |
 | `proximity_margin` | 0.15 | Person box inflation when testing "near" |
-| `min_containment` | 0.30 | Fraction of phone inside person to count |
+| `min_containment` | 0.10 | Fraction of phone inside person to count |
 | `snapshot_cooldown_seconds` | 5.0 | Gap between snapshots in one episode |
+| `crowd_enabled` | True | Turn the crowd-gathering rule on/off |
+| `crowd_max_persons` | 3 | **Allowed** group size; the next person triggers |
+| `crowd_proximity_factor` | 0.6 | How close counts as together, as a fraction of body height |
+| `crowd_hold_seconds` | 3.0 | How long a group must persist before logging |
+| `crowd_clear_seconds` | 3.0 | How long dispersed before the episode ends |
+| `ppe_enabled` | False | Helmet rule; needs a PPE-trained model (see above) |
+| `helmet_class_id` | 1 | Helmet class id **in your PPE model**, not COCO |
+| `head_class_id` | None | Head class id; set it to match helmet vs head position |
+| `ppe_hold_seconds` | 5.0 | How long a helmet must be absent before logging |
 | `inference_imgsz` | 1280 | Detection resolution (accuracy vs speed); cost scales ~quadratically |
 | `frame_stride` | 1 | Process every Nth frame — with `inference_imgsz`, the main throughput dial |
 | `max_feeds` | 80 | Admission limit on concurrent feeds (not a VRAM ceiling) |
@@ -238,7 +369,7 @@ per feed (e.g. `inference_imgsz`).
 | `fps_budget` | 0 | Measured detection fps of this GPU; 0 makes central count slots and overcommit |
 | `raw_max_streams` | 16 | Concurrent raw video decodes (one per watched tile) |
 | `hw_decode` | True | NVDEC hardware decode, with automatic software fallback |
-| `batch_max_size` / `batch_max_wait_ms` | 16 / 12 | Batching in the single inference process |
+| `batch_max_size` / `batch_max_wait_ms` | 16 / 0 | Batching in the single inference process (0 = never wait, just take what arrived) |
 
 Time-based thresholds are expressed in **seconds** and converted to frames using
 each stream's real FPS, so "1 second of phone use" means 1 real second across

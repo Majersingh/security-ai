@@ -346,7 +346,6 @@ async def add_stream(payload: dict) -> JSONResponse:
     mgr: FeedManager = app.state.feeds
     loop = asyncio.get_event_loop()
     cfg = Config()
-    cfg.write_output_video = False
     max_lag = cfg.stream_max_lag_seconds if cfg.drop_when_behind else 0.0
     try:
         source = await loop.run_in_executor(

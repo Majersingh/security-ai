@@ -6,8 +6,12 @@ module owns the *identity policy*: it turns the raw tracked detections into the
 two clean streams the behaviour layer needs.
 
 * persons  -- only those with a valid, persistent ``tracker_id``
-* phones   -- tracker ids stripped (we re-associate phones to a person each
-              frame, so a phone identity is not useful)
+* objects  -- every other class, keyed by class id, with tracker ids stripped
+              (we re-associate a phone or a helmet to a person each frame, so
+              an identity for the object itself is not useful)
+
+Keyed by class id rather than split into named streams, so adding a PPE item is
+a config entry plus a rule — this module does not change.
 
 Keeping this separate means the behaviour rules never worry about malformed ids,
 and future track-lifecycle logic (smoothing, re-id, dwell time) has a home.
@@ -16,7 +20,7 @@ and future track-lifecycle logic (smoothing, re-id, dwell time) has a home.
 from __future__ import annotations
 
 import logging
-from typing import Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import supervision as sv
@@ -27,18 +31,26 @@ logger = logging.getLogger("operator_monitor")
 
 
 class Tracker:
-    """Splits tracked detections into validated persons and phones."""
+    """Splits tracked detections into validated persons and per-class objects."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        logger.info("Tracker routing ready.")
+        self._object_ids = sorted(config.object_class_names())
+        logger.info("Tracker routing ready (object classes: %s).", self._object_ids)
 
     def route(
         self, detections: sv.Detections
-    ) -> Tuple[sv.Detections, sv.Detections]:
-        """Return ``(persons_with_ids, phones)``."""
+    ) -> Tuple[sv.Detections, Dict[int, sv.Detections]]:
+        """Return ``(persons_with_ids, {class_id: detections})``.
+
+        Every configured object class gets an entry, empty or not, so rules can
+        index without guarding — a rule asking for helmets on a frame with none
+        should see "no helmets", not a missing key.
+        """
+        empty = sv.Detections.empty()
+        objects: Dict[int, sv.Detections] = {cid: empty for cid in self._object_ids}
         if len(detections) == 0:
-            return detections, detections
+            return detections, objects
 
         is_person = detections.class_id == self._config.person_class_id
 
@@ -48,6 +60,9 @@ class Tracker:
             valid = np.array([tid is not None and tid >= 0 for tid in persons.tracker_id])
             persons = persons[valid]
 
-        phones = detections[~is_person]
-        phones.tracker_id = None  # phones are re-associated per frame, not tracked
-        return persons, phones
+        for cid in self._object_ids:
+            found = detections[detections.class_id == cid]
+            # Re-associated to a person each frame, so an identity is not useful.
+            found.tracker_id = None
+            objects[cid] = found
+        return persons, objects

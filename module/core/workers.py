@@ -105,7 +105,6 @@ async def _worker_loop(
             return
         import copy
         feed_cfg = copy.copy(cfg)
-        feed_cfg.write_output_video = False
         try:
             feed = mgr.create(source, feed_cfg, msg.get("zone"), msg.get("line_start"),
                               msg.get("line_end"), name=msg.get("name", msg["url"]),

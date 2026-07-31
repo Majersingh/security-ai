@@ -1,0 +1,52 @@
+# Dataset definition for fine-tuning ONE model over every class this system needs.
+#
+# Why all three and not just helmet: fine-tuning replaces the detection head with
+# the class list below. A model trained on helmets alone forgets person and phone,
+# which silently kills the rest of the pipeline. Train them together, in one
+# forward pass, and the GPU budget is unchanged.
+#
+# The ids here become the model's OUTPUT ids — they are NOT COCO ids. After
+# training, set these in module/core/config.py:
+#
+#     person_class_id = 0
+#     helmet_class_id = 1
+#     phone_class_id  = 2
+#     head_class_id   = 3
+#
+# `path` is relative to this file. Ultralytics expects, under each split dir:
+#     images/<split>/*.jpg      labels/<split>/*.txt
+# with one label line per object: "<class_id> <cx> <cy> <w> <h>", normalised 0-1.
+#
+# ---------------------------------------------------------------------------
+# LABELLING RULE FOR head + helmet — get this wrong and the model learns noise.
+#
+# `head` means ANY visible head: covered or bare, front, back, side, top-down.
+# Do NOT judge compliance while labelling. Draw what you see:
+#
+#     every visible head  -> `head`   (3) around the head
+#     every helmet        -> `helmet` (1) around the helmet, wherever it is
+#     head not visible    -> neither. `person` (0) only.
+#
+# So a worker wearing a helmet gets BOTH boxes: `head` on the head, `helmet` on
+# the helmet, overlapping. That is correct and expected. A worker carrying a
+# helmet also gets both — head up top, helmet down at the hand.
+#
+# The RULE decides violations at runtime, by comparing the two positions: helmet
+# on the head = compliant, helmet anywhere else = not wearing it. Keeping that
+# judgement out of the labels is what lets you change policy later (caps, hoods)
+# without relabelling anything.
+#
+# Label heads seen from BEHIND too. A ceiling camera sees the backs and tops of
+# heads far more often than faces; if the data is all faces, the model misses the
+# view your cameras actually produce.
+# ---------------------------------------------------------------------------
+
+path: ./dataset
+train: images/train
+val: images/val
+
+names:
+  0: person
+  1: helmet
+  2: phone
+  3: head        # ANY visible head, covered or not — see the labelling rule above

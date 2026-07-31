@@ -46,6 +46,10 @@ module/output
 # ---- Ultralytics / training artifacts ----
 runs/
 *.cache
+# Raw footage and extracted frames: large, and often not ours to redistribute.
+training/videos/*
+!training/videos/README.txt
+training/dataset/
 
 # ---- Logs ----
 *.log

@@ -35,7 +35,6 @@ def cfg_for(wait_ms: int) -> Config:
     cfg.log_timing = False
     cfg.events_csv = SCRATCH / f"w{wait_ms}" / "events.csv"
     cfg.snapshots_dir = SCRATCH / f"w{wait_ms}" / "snapshots"
-    cfg.write_output_video = False
     return cfg
 
 

@@ -36,8 +36,6 @@ def make_cfg() -> Config:
     cfg.log_timing = False
     cfg.events_csv = SCRATCH / "events.csv"
     cfg.snapshots_dir = SCRATCH / "snapshots"
-    cfg.output_video = SCRATCH / "annotated.mp4"
-    cfg.write_output_video = False
     return cfg
 
 

@@ -79,7 +79,10 @@ class ModelRunner:
         # that flood is itself a measurable cost in stderr I/O and lock contention.
         # 16 = FP16, None = FP32.
         self._quantize = 16 if fp16 else None
-        self._keep = sorted({cfg.person_class_id, cfg.phone_class_id})
+        # Every class any active rule needs — person, phone, and PPE items when a
+        # PPE model is configured. Config owns the list so adding an item does not
+        # touch the inference path.
+        self._keep = cfg.detect_class_ids()
         self.max_batch = max(1, int(cfg.batch_max_size))
 
         logger.info("Loading the shared model '%s' ...", cfg.model_path)

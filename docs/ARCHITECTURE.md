@@ -1,6 +1,7 @@
 # Architecture — CCTV operator monitoring
 
-Detects operator behaviour (phone usage, zone intrusion, line crossing) across many
+Detects operator behaviour (phone usage, zone intrusion, line crossing, crowd
+gathering, and helmet compliance when a PPE model is loaded) across many
 live camera streams, with zone/line geometry drawn per camera, and scales by adding
 GPU hosts.
 
@@ -333,5 +334,23 @@ being acceptable once event history has to survive an upgrade.
   — likely a bigger win than anything in §5.
 - **What `frame_stride` do the rules actually need?** High stride coarsens the
   debounce state machine (`violation_start_seconds = 1.0` is ~3 analysed frames at
-  stride 10) and may cost recall. Asserted but never measured.
+  stride 10) and may cost recall. Asserted but never measured. Rules with a longer
+  clock of their own (`crowd_hold_seconds = 3.0`) tolerate stride better, which is
+  a reason to prefer per-rule timescales over one global value.
+- **Absence-based PPE is a different kind of claim.** Every other rule fires on
+  evidence that exists; `HelmetComplianceRule` fires on evidence that is missing, so
+  a detector failure and a real violation are indistinguishable at the rule level.
+  The suppressors and the 5 s hold bound the damage but cannot remove it. A trained
+  `head` class (`head_class_id`) tightens the question from "is a helmet somewhere in
+  the top third of this person?" to "is a helmet on THIS head?", which is the only
+  way to tell a worn helmet from a carried one — but the claim stays an absence.
+  Whether the dataset carries that class is a labelling decision, not a code one.
+- **One model or two for PPE?** A second, PPE-only model doubles GPU cost on a box
+  already at ~143 fps; fine-tuning one model over person + phone + helmet keeps a
+  single forward pass. Untested — no PPE weights exist in this repo yet.
+- **Should a crowd be one event or N?** `CrowdGatheringRule` emits an observation per
+  member, so a group of 5 logs 5 rows and 5 snapshots of the same group box per
+  cooldown. That matches the `Event` schema (which is keyed by `Person ID`) and how
+  zone intrusion already behaves, but a genuine group-level event would need a
+  collective path through `BehaviorEngine` alongside `Observation`/`InstantEvent`.
 - **What replaces `supervision.ByteTrack` before 0.30?**

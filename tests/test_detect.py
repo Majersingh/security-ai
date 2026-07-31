@@ -32,7 +32,6 @@ def base_cfg() -> Config:
     cfg.log_timing = False
     cfg.events_csv = SCRATCH / "events.csv"
     cfg.snapshots_dir = SCRATCH / "snapshots"
-    cfg.write_output_video = False
     return cfg
 
 

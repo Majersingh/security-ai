@@ -1,8 +1,8 @@
 """Central configuration for the CCTV Operator Monitoring System.
 
-Every tunable value lives here. No other module hard-codes paths, thresholds,
-colours or class ids. The web server constructs a :class:`Config` per feed and
-may tweak a few fields (e.g. ``inference_imgsz``) before the pipeline runs.
+Every tunable value lives here. No other module hard-codes paths, thresholds or
+class ids. The web server constructs a :class:`Config` per feed and may tweak a
+few fields (e.g. ``inference_imgsz``) before the pipeline runs.
 
 Thresholds are expressed in *seconds* rather than frames. The pipeline converts
 them to a frame count using the video's real FPS, so behaviour is consistent
@@ -13,15 +13,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from utils import physical_cores
 
 # Project root = one level above this ``src`` directory.
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent
-
-# BGR colours (OpenCV convention).
-Color = Tuple[int, int, int]
 
 
 @dataclass
@@ -29,8 +26,8 @@ class Config:
     """Runtime configuration. Instantiate once and pass down the pipeline."""
 
     # ------------------------------------------------------------------ paths
-    input_video: Path = ROOT_DIR / "input" / "operator.mp4"
-    output_video: Path = ROOT_DIR / "output" / "annotated.mp4"
+    # No video paths: the detection service reads live stream URLs and writes no
+    # video at all. Snapshots and the events CSV are the only artefacts.
     events_csv: Path = ROOT_DIR / "output" / "events.csv"
     snapshots_dir: Path = ROOT_DIR / "output" / "snapshots"
     model_path: Path = ROOT_DIR / "models" / "yolo11n.pt"
@@ -84,13 +81,82 @@ class Config:
     # at least this fraction of the box area. 0.0 = any overlap at all triggers.
     zone_overlap_ratio: float = 0.0
 
-    # -------------------------------------------------------------- rendering
-    color_person: Color = (0, 200, 0)      # green
-    color_phone: Color = (255, 128, 0)     # blue-ish (BGR)
-    color_violation: Color = (0, 0, 255)   # red
-    box_thickness: int = 2
-    font_scale: float = 0.6
-    write_output_video: bool = True
+    # ------------------------------------------------------------- PPE: helmet
+    # REQUIRES A PPE-TRAINED MODEL. COCO has no helmet class, so this stays off
+    # until `model_path` points at a model that detects one — see README.
+    #
+    # This rule infers a violation from the ABSENCE of a helmet, which is
+    # inherently noisier than detecting one: a person facing away, occluded by
+    # machinery, or simply too far to resolve all look identical to a bare head.
+    # Every knob below exists to suppress one of those, so treat them as part of
+    # the detector, not as fine-tuning.
+    ppe_enabled: bool = False
+    helmet_class_id: int = 1            # class id in YOUR ppe model, not COCO
+
+    # A `head` class, and the single biggest accuracy win available here. Label a
+    # box on EVERY visible head — covered or not, front, back or side — and a box
+    # on every helmet. The rule then compares the two positions: a helmet ON that
+    # head is compliance, a helmet anywhere else (in the hand, at the chest, on the
+    # floor) is not.
+    #
+    # Why it beats having no head class: without one, the rule has to guess where
+    # the head is from the person box and ask the coarse question "is a helmet
+    # somewhere in the top third?". With one, it asks "is a helmet on THIS head?",
+    # which is the question you actually mean, and which is the only way to tell a
+    # worn helmet from a carried one.
+    #
+    # Note the alert still rests on the helmet being MISSING, so a helmet the model
+    # fails to see accuses a compliant worker. That is what the suppressors below
+    # are for; they apply whether or not a head class is present.
+    #
+    # None = your model has no head class; the rule falls back to the coarse
+    # top-of-the-person-box question.
+    head_class_id: Optional[int] = None
+
+    # The head region: the top fraction of the person box, extended upward by
+    # `ppe_head_margin` because detectors clip the box at the scalp while a
+    # helmet sits above it.
+    ppe_head_region: float = 0.35
+    ppe_head_margin: float = 0.10       # of person box height, added above
+
+    # --- suppressors (each kills a specific false-positive source) ---
+    # Too far away to resolve a helmet at all. At imgsz 1280 a person shorter
+    # than ~120 px yields a helmet of a few pixels; absence proves nothing.
+    ppe_min_person_height: int = 120
+    # A weak person detection with no helmet nearby is usually not a person.
+    ppe_min_person_conf: float = 0.5
+    # A person cropped by the top frame edge has their head out of shot, so no
+    # helmet CAN be detected. Skip them rather than accuse them.
+    ppe_edge_margin: int = 8
+    # The strongest suppressor: a miss must persist. A helmet flickering out for
+    # a few frames (motion blur, someone walking past) must not fire an event.
+    ppe_hold_seconds: float = 5.0
+    ppe_clear_seconds: float = 2.0
+
+    # ---------------------------------------------------------- crowd gathering
+    # Fires when MORE than `crowd_max_persons` people stand close enough together
+    # for `crowd_hold_seconds`. Needs no extra model — it is pure geometry over
+    # the person boxes the detector already produces.
+    crowd_enabled: bool = True
+
+    # The ALLOWED group size. 3 means "up to 3 together is fine, the 4th triggers".
+    # This is the main knob: raise it in busy areas, lower it where any huddle
+    # matters. 0 would flag every lone person, so it is clamped to >= 1.
+    crowd_max_persons: int = 3
+
+    # How close counts as "together", as a fraction of the people's own box
+    # height rather than raw pixels — a person 400 px tall (near the camera) and
+    # one 80 px tall (far away) then need proportionally similar real-world gaps,
+    # so one setting works across the whole frame and across resolutions.
+    # 0.6 ~ "within about half a body-width of each other". Raise to group people
+    # who are merely in the same area; lower to require near-touching.
+    crowd_proximity_factor: float = 0.6
+
+    # Crowd-specific debounce, overriding violation_start/end_seconds (which are
+    # tuned for phone usage at 1.0s). People pass each other constantly, so a
+    # crowd must PERSIST before it is an event or every corridor crossing fires.
+    crowd_hold_seconds: float = 3.0     # gathered this long -> event
+    crowd_clear_seconds: float = 3.0    # dispersed this long -> episode over
 
     # --------------------------------------------------------------- runtime
     log_level: str = "INFO"
@@ -221,11 +287,30 @@ class Config:
             "phone_usage": "Mobile Phone Usage",
             "zone_intrusion": "Zone Intrusion",
             "line_crossing": "Line Crossing",
+            "crowd_gathering": "Crowd Gathering",
+            "no_helmet": "No Helmet (PPE)",
         }
     )
 
+    def object_class_names(self) -> Dict[int, str]:
+        """Non-person classes the pipeline cares about: ``{class_id: wire name}``.
+
+        The single place that decides which classes the detector keeps, how the
+        behaviour layer keys them, and what the browser sees. Adding a PPE item
+        later means one entry here plus a rule — nothing in between changes.
+        """
+        names = {self.phone_class_id: "phone"}
+        if self.ppe_enabled:
+            names[self.helmet_class_id] = "helmet"
+            if self.head_class_id is not None:
+                names[self.head_class_id] = "head"
+        return names
+
+    def detect_class_ids(self) -> List[int]:
+        """Every class id the model should return, persons included."""
+        return sorted({self.person_class_id, *self.object_class_names()})
+
     def ensure_output_dirs(self) -> None:
         """Create output directories if they do not exist."""
-        self.output_video.parent.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.events_csv.parent.mkdir(parents=True, exist_ok=True)

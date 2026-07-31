@@ -88,6 +88,7 @@ class FrameProcessor:
             zone_polygon=poly_px(self._norm_zone),
             line_start=pt_px(self._norm_line_start),
             line_end=pt_px(self._norm_line_end),
+            frame_size=(width, height),
         )
         self._engine = BehaviorEngine(
             config=self._config,
@@ -117,10 +118,10 @@ class FrameProcessor:
         if detections is None:
             detections = sv.Detections.empty()
         tracked = self._bytetrack.update_with_detections(detections)
-        persons, phones = self._tracker.route(tracked)
-        result = self._engine.process(persons, phones, frame_index, frame)
+        persons, objects = self._tracker.route(tracked)
+        result = self._engine.process(persons, objects, frame_index, frame)
         new_events = self._event_log.events[before:]
-        return persons, phones, result, new_events
+        return persons, objects, result, new_events
 
     def process_json(self, frame: np.ndarray, frame_index: int, detections=None):
         """Run the pipeline and return DETECTIONS as plain data (no image).
@@ -128,7 +129,7 @@ class FrameProcessor:
         Returns (boxes, new_events, width, height).
         """
         h, w = frame.shape[:2]
-        persons, phones, result, new_events = self._run(frame, frame_index, detections)
+        persons, objects, result, new_events = self._run(frame, frame_index, detections)
         boxes: List[dict] = []
         for i in range(len(persons)):
             tid = int(persons.tracker_id[i]) if persons.tracker_id is not None else -1
@@ -139,11 +140,16 @@ class FrameProcessor:
                 "violation": tid in result.violating_track_ids,
                 "label": result.labels.get(tid, ""),
             })
-        for j in range(len(phones)):
-            x1, y1, x2, y2 = (float(v) for v in phones.xyxy[j])
-            conf = float(phones.confidence[j]) if phones.confidence is not None else 0.0
-            boxes.append({"cls": "phone", "conf": conf,
-                          "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        # Every configured object class goes on the wire under its own name, so a
+        # new PPE item shows up in the browser without touching this loop.
+        names = self._config.object_class_names()
+        for class_id, dets in objects.items():
+            name = names.get(class_id, str(class_id))
+            for j in range(len(dets)):
+                x1, y1, x2, y2 = (float(v) for v in dets.xyxy[j])
+                conf = float(dets.confidence[j]) if dets.confidence is not None else 0.0
+                boxes.append({"cls": name, "conf": conf,
+                              "x1": x1, "y1": y1, "x2": x2, "y2": y2})
         return boxes, new_events, w, h
 
     @property
