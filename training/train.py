@@ -18,11 +18,71 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(ROOT / "module" / "core"))
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+
+def resolved_data(data_yaml: Path) -> Path:
+    """Return a copy of ``data_yaml`` whose ``path:`` is absolute.
+
+    Ultralytics resolves a RELATIVE ``path:`` against its own ``datasets_dir``
+    setting (``~/.config/Ultralytics/settings.json``), not against the yaml file
+    — so ``path: ./dataset`` looks for ``<datasets_dir>/dataset`` and training
+    dies with "images not found". Resolving it here, relative to the yaml as the
+    comments in ppe.yaml promise, keeps the checked-in file machine independent:
+    the repo can live at any path, on any box, with no per-machine settings.
+    """
+    import yaml
+
+    spec = yaml.safe_load(data_yaml.read_text())
+    root = Path(spec.get("path", "."))
+    if root.is_absolute():
+        return data_yaml
+
+    spec["path"] = str((data_yaml.parent / root).resolve())
+    out = Path(tempfile.gettempdir()) / f"{data_yaml.stem}.resolved.yaml"
+    out.write_text(yaml.safe_dump(spec, sort_keys=False, allow_unicode=True))
+    return out
+
+
+def check_splits(data_yaml: Path) -> int:
+    """Count images per split and explain the fix when one is empty.
+
+    Ultralytics' own error names the path it guessed and nothing else, which is
+    unhelpful when the real problem is "you have not run split.py yet".
+    """
+    import yaml
+
+    spec = yaml.safe_load(data_yaml.read_text())
+    root = Path(spec["path"])
+    counts = {}
+    for split in ("train", "val"):
+        d = root / spec.get(split, f"images/{split}")
+        counts[split] = (
+            sum(1 for p in d.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+            if d.is_dir() else 0
+        )
+    print(f"dataset {root}   train {counts['train']}   val {counts['val']}")
+
+    if not counts["train"]:
+        print("\nNo training images. Run, in order:\n"
+              "  1. put clips in training/videos/\n"
+              "  2. python training/extract_frames.py\n"
+              "  3. python training/prelabel.py\n"
+              "  4. label heads + helmets by hand (see training/README.md)\n"
+              "  5. python training/split.py")
+        return 1
+    if not counts["val"]:
+        print("\nNo validation images — the run would have nothing to score "
+              "against.\n  python training/split.py      # moves 15% of train to val")
+        return 1
+    return 0
 
 
 def main() -> int:
@@ -45,6 +105,10 @@ def main() -> int:
         print(f"Missing {args.data}")
         return 1
 
+    data = resolved_data(args.data.resolve())
+    if check_splits(data):
+        return 1
+
     imgsz = args.imgsz
     if imgsz <= 0:
         from config import Config
@@ -55,7 +119,7 @@ def main() -> int:
 
     model = YOLO(args.model)
     model.train(
-        data=str(args.data),
+        data=str(data),
         epochs=args.epochs,
         imgsz=imgsz,
         batch=args.batch,
@@ -70,7 +134,7 @@ def main() -> int:
         patience=30,          # stop early rather than overfit a small dataset
     )
 
-    metrics = model.val(data=str(args.data), imgsz=imgsz, device=args.device)
+    metrics = model.val(data=str(data), imgsz=imgsz, device=args.device)
     print("\nPer-class results (recall is the one to watch):")
     print(f"{'class':>10} {'precision':>10} {'recall':>10} {'mAP50':>10}")
     print("-" * 44)
