@@ -31,7 +31,9 @@ class Config:
     output_video: Path = ROOT_DIR / "output" / "annotated.mp4"
     events_csv: Path = ROOT_DIR / "output" / "events.csv"
     snapshots_dir: Path = ROOT_DIR / "output" / "snapshots"
-    model_path: Path = ROOT_DIR / "models" / "yolo11n.pt"
+    # yolo26n over yolo11n: same COCO 80 classes and person/phone accuracy, but
+    # NMS-free, so the ~2 ms/image postprocess disappears. Auto-downloads here.
+    model_path: Path = ROOT_DIR / "models" / "yolo26n.pt"
 
     # ------------------------------------------------------------------ model
     # COCO class ids: 0 = person, 67 = cell phone. We ignore all other classes.

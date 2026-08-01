@@ -57,8 +57,8 @@ pip install -r requirements-web.txt
 pip install -r requirements.txt
 ```
 
-The YOLOv11 weight (`yolo11n.pt`, ~5 MB) downloads automatically on first run
-and is cached in `models/`. If the machine is offline, copy `models/yolo11n.pt`
+The YOLO26 weight (`yolo26n.pt`, ~5 MB) downloads automatically on first run
+and is cached in `models/`. If the machine is offline, copy `models/yolo26n.pt`
 over manually.
 
 ---
@@ -128,7 +128,7 @@ mid/high GPU well above real-time.
 | `ImportError: libGL.so.1` (Linux) | `sudo apt install -y libgl1 libglib2.0-0` |
 | Camera button does nothing / blocked | Browsers allow camera only on `https://` or `http://localhost`. Use localhost, or serve over HTTPS (e.g. a Cloudflare tunnel). |
 | `Input video not found` | Put a file at `input/operator.mp4` or pass `--input`. |
-| Phone never detected | High-res footage needs `inference_imgsz=1280` (already the default); try a larger model with `--model yolo11s.pt`. |
+| Phone never detected | High-res footage needs `inference_imgsz=1280` (already the default); try a larger model with `--model yolo26s.pt`. |
 | First run hangs at start | It's downloading the model weight — needs internet once. |
 | GPU not used | `torch.cuda.is_available()` is `False` → install a CUDA build of PyTorch (see above). |
 

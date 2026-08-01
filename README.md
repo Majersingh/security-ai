@@ -62,8 +62,8 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-This installs Ultralytics (YOLOv11), Supervision (ByteTrack + annotators),
-OpenCV, NumPy and Pandas. The YOLOv11 weight (`yolo11n.pt`) is downloaded
+This installs Ultralytics (YOLO26), Supervision (ByteTrack + annotators),
+OpenCV, NumPy and Pandas. The YOLO26 weight (`yolo26n.pt`) is downloaded
 automatically on first run and cached in `models/`.
 
 > GPU is optional. Default device is `cpu`; pass `--device 0` for CUDA or
@@ -117,7 +117,7 @@ output/
 security-ai/
   input/            operator.mp4          (source video)
   output/           annotated.mp4, events.csv, snapshots/
-  models/           yolo11n.pt            (auto-downloaded weights)
+  models/           yolo26n.pt            (auto-downloaded weights)
   src/              main, detector, tracker, behavior, annotator, events, config, utils
   requirements.txt
   README.md
@@ -249,9 +249,9 @@ motion. Also honoured by the web UI's upload mode.
   detected **0** phones; at `imgsz=1280` it detected the phone in ~93% of
   sampled frames. `inference_imgsz` therefore defaults to `1280`. Lower it for
   speed on low-res footage, raise it if phones are still missed.
-- **Model size.** `yolo11n` (nano) is the fastest and auto-downloaded default.
-  For better small-object recall swap to `yolo11s`/`yolo11m` via
-  `--model models/yolo11m.pt` (Ultralytics downloads it automatically).
+- **Model size.** `yolo26n` (nano) is the fastest and auto-downloaded default.
+  For better small-object recall swap to `yolo26s`/`yolo26m` via
+  `--model models/yolo26m.pt` (Ultralytics downloads it automatically).
 - **Confidence / thresholds.** `--conf`, `--start-seconds` and the proximity
   values in `config.py` trade sensitivity against false positives.
 - **Speed.** CPU inference on 1440p is ~2–5 fps. Use `--device 0` (CUDA) or
