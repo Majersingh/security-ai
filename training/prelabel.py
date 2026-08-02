@@ -23,9 +23,20 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def hms(seconds: float) -> str:
+    """Seconds -> "4m12s" / "1h04m". Progress on 30k images needs a readable ETA."""
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 # COCO class id -> the id this dataset uses (see training/ppe.yaml).
 # Helmet has no COCO equivalent, which is the entire reason for this exercise.
@@ -116,34 +127,62 @@ def main() -> int:
     model = YOLO(args.model)
 
     counts = {0: 0, 2: 0}
-    for image in todo:
-        result = model.predict(source=str(image), imgsz=args.imgsz, conf=args.conf,
-                               classes=sorted(COCO_TO_DATASET), verbose=False)[0]
-        lines = []
-        for box in result.boxes:
-            dataset_id = COCO_TO_DATASET.get(int(box.cls))
-            if dataset_id is None:
-                continue
-            cx, cy, w, h = box.xywhn[0].tolist()     # already normalised 0-1
-            lines.append(f"{dataset_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-            counts[dataset_id] += 1
+    done = 0
+    interrupted = False
+    start = time.time()
+    last_tick = 0.0
+    total = len(todo)
 
-        out = label_path_for(image)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if args.append and out.exists():
-            existing = out.read_text()
-            # A file whose last line has no newline would otherwise be joined onto
-            # our first line, corrupting both boxes.
-            if existing and not existing.endswith("\n"):
-                existing += "\n"
-            out.write_text(existing + "\n".join(lines) + ("\n" if lines else ""))
-        else:
-            # An empty file is meaningful: "reviewed, nothing here". Ultralytics reads
-            # it as a background image, which is a useful training signal.
-            out.write_text("\n".join(lines) + ("\n" if lines else ""))
+    try:
+        for image in todo:
+            result = model.predict(source=str(image), imgsz=args.imgsz, conf=args.conf,
+                                   classes=sorted(COCO_TO_DATASET), verbose=False)[0]
+            lines = []
+            for box in result.boxes:
+                dataset_id = COCO_TO_DATASET.get(int(box.cls))
+                if dataset_id is None:
+                    continue
+                cx, cy, w, h = box.xywhn[0].tolist()     # already normalised 0-1
+                lines.append(f"{dataset_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+                counts[dataset_id] += 1
 
-    print(f"\nWrote {len(todo)} label files: "
-          f"{counts[0]} person, {counts[2]} phone, 0 helmet.")
+            out = label_path_for(image)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if args.append and out.exists():
+                existing = out.read_text()
+                # A file whose last line has no newline would otherwise be joined
+                # onto our first line, corrupting both boxes.
+                if existing and not existing.endswith("\n"):
+                    existing += "\n"
+                out.write_text(existing + "\n".join(lines) + ("\n" if lines else ""))
+            else:
+                # An empty file is meaningful: "reviewed, nothing here". Ultralytics
+                # reads it as a background image, a useful training signal.
+                out.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+            # Each file is written before the next image is read, so the run is
+            # resumable: whatever finished stays done and a re-run skips it.
+            done += 1
+            now = time.time()
+            if now - last_tick >= 0.5 or done == total:
+                last_tick = now
+                rate = done / max(now - start, 1e-6)
+                print(f"\r  {done}/{total} ({100 * done / total:.0f}%)  "
+                      f"{rate:.1f} img/s  elapsed {hms(now - start)}  "
+                      f"eta {hms((total - done) / rate) if rate else '?'}  "
+                      f"person={counts[0]} phone={counts[2]}",
+                      end="", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+    print()
+
+    print(f"Wrote {done} label file(s): {counts[0]} person, {counts[2]} phone.")
+    if interrupted:
+        remaining = total - done
+        print(f"INTERRUPTED with {remaining} image(s) left. Every file already "
+              f"written is complete and kept — re-run the SAME command and it "
+              f"resumes, skipping the {done} done.")
+        return 130
     print("Now open the folder in your labelling tool, CHECK for missed people, "
           "and draw the helmets (class 1).")
     return 0
