@@ -33,6 +33,21 @@ COCO_TO_DATASET = {0: 0, 67: 2}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
+def class_ids_in(label: Path) -> set:
+    """The class ids already present in a label file. Missing/empty file -> set()."""
+    if not label.exists():
+        return set()
+    ids = set()
+    for line in label.read_text().splitlines():
+        first = line.split(maxsplit=1)
+        if first:
+            try:
+                ids.add(int(first[0]))
+            except ValueError:          # not a label line; ignore rather than crash
+                continue
+    return ids
+
+
 def label_path_for(image: Path) -> Path:
     """``.../images/train/x.jpg`` -> ``.../labels/train/x.txt`` (YOLO convention)."""
     parts = list(image.parts)
@@ -62,17 +77,36 @@ def main() -> int:
     ap.add_argument("--overwrite", action="store_true",
                     help="re-label images that already have a label file. OFF by "
                          "default so this can never destroy your hand-drawn helmets")
+    ap.add_argument("--append", action="store_true",
+                    help="ADD the detected boxes to existing label files instead of "
+                         "skipping them. For a downloaded PPE dataset that labels "
+                         "helmets but no people: this fills in the missing person "
+                         "boxes and keeps every existing line untouched")
     args = ap.parse_args()
+
+    if args.append and args.overwrite:
+        print("--append and --overwrite are opposites: one keeps existing lines, "
+              "the other replaces them. Pick one.")
+        return 1
 
     images = sorted(p for p in args.images.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES)
     if not images:
         print(f"No images in {args.images} — run extract_frames.py first.")
         return 1
 
-    todo = [p for p in images if args.overwrite or not label_path_for(p).exists()]
+    written = set(COCO_TO_DATASET.values())
+    if args.append:
+        # Skip a file that ALREADY holds one of the ids we write, so a second run
+        # cannot double-label the same person. Without this, re-running (which the
+        # default mode makes safe and habitual) silently duplicates every box.
+        todo = [p for p in images if not (class_ids_in(label_path_for(p)) & written)]
+    else:
+        todo = [p for p in images if args.overwrite or not label_path_for(p).exists()]
     skipped = len(images) - len(todo)
     if not todo:
-        print(f"All {len(images)} images already have labels (--overwrite to redo).")
+        hint = ("every label file already contains person/phone boxes"
+                if args.append else "--overwrite to redo")
+        print(f"Nothing to do for {len(images)} images ({hint}).")
         return 0
 
     from ultralytics import YOLO           # heavy import, only needed here
@@ -96,9 +130,17 @@ def main() -> int:
 
         out = label_path_for(image)
         out.parent.mkdir(parents=True, exist_ok=True)
-        # An empty file is meaningful: "reviewed, nothing here". Ultralytics reads
-        # it as a background image, which is a useful training signal.
-        out.write_text("\n".join(lines) + ("\n" if lines else ""))
+        if args.append and out.exists():
+            existing = out.read_text()
+            # A file whose last line has no newline would otherwise be joined onto
+            # our first line, corrupting both boxes.
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            out.write_text(existing + "\n".join(lines) + ("\n" if lines else ""))
+        else:
+            # An empty file is meaningful: "reviewed, nothing here". Ultralytics reads
+            # it as a background image, which is a useful training signal.
+            out.write_text("\n".join(lines) + ("\n" if lines else ""))
 
     print(f"\nWrote {len(todo)} label files: "
           f"{counts[0]} person, {counts[2]} phone, 0 helmet.")

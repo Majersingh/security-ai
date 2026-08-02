@@ -50,6 +50,7 @@ runs/
 training/videos/*
 !training/videos/README.txt
 training/dataset/
+training/ppe-train/
 
 # ---- Logs ----
 *.log

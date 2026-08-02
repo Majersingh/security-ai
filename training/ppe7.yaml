@@ -1,0 +1,46 @@
+# Seven-class PPE dataset: the public construction-safety download, remapped.
+#
+# WHY THESE ID NUMBERS. Class ids are not "reserved" by COCO — COCO's 0/67 are
+# just the order of ITS names list. Ultralytics requires ids **contiguous from
+# 0** with nc = len(names), so ids in the 90-100 range would force nc=101 and
+# give the model 94 permanently empty outputs.
+#
+# So the collision is avoided by declaring the whole list up front instead:
+#
+#   0 person  and  2 phone  are LEFT EMPTY for now. `prelabel.py` writes exactly
+#   those two ids (COCO_TO_DATASET = {0: 0, 67: 2}), so appending later needs no
+#   renumbering and no edit to that script.
+#
+#   1 hardhat  keeps module/core/config.py's `helmet_class_id = 1` valid, so the
+#   existing helmet rule still points at the right class.
+#
+# Remap applied to training/ppe-train/labels (originals in labels-original.tar.gz):
+#
+#     source 3  Hardhat      -> 1     28,996 boxes
+#     source 0  Fall-Detected-> 3      3,149
+#     source 1  Gloves       -> 4      3,381
+#     source 12 Safety Cone  -> 5      9,843
+#     source 13 Safety Vest  -> 6      4,499
+#
+#     dropped: Goggles, Ladder, Mask, NO-Gloves, NO-Goggles, NO-Hardhat,
+#              NO-Mask, NO-Safety Vest, Person
+#
+# NOTE the download's own Person boxes (1,034) were dropped per the keep-list;
+# person comes from `prelabel.py --append` instead.
+#
+# `val` must stay YOUR OWN footage. These are eye-level construction photos in
+# good light; scoring on them measures performance on the internet, not on a
+# ceiling-mounted camera.
+
+path: .
+train: ppe-train/images
+val: dataset/images/val
+
+names:
+  0: person          # appended later by prelabel.py
+  1: hardhat
+  2: phone           # appended later by prelabel.py
+  3: fall-detected
+  4: gloves
+  5: safety-cone
+  6: safety-vest
