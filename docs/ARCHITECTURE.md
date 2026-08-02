@@ -74,7 +74,7 @@ RSS per camera, plus a model load per camera added. Containerise by **role**.
   detection — video load follows *viewers*, detection follows *cameras*.
 - Concurrency per host is bounded by **CPU** (decode, tracking, snapshots, plus one
   extra decode per watched tile) and by **GPU detection throughput** — not VRAM. One
-  `yolo11n.pt` is 5.6 MB and a single shared model serves every feed.
+  `yolo26n.pt` is 5.5 MB and a single shared model serves every feed.
 
 ---
 
@@ -289,7 +289,7 @@ being acceptable once event history has to survive an upgrade.
 
 ## 7. Trade-offs and risks
 
-- **Detection accuracy is unmeasured.** `yolo11n` (the smallest variant) on generic
+- **Detection accuracy is unmeasured.** `yolo26n` (the smallest variant) on generic
   COCO class 67 "cell phone", no labelled test set, no precision/recall. Every
   measurement in this document is throughput. **This is the largest risk in the
   project** and none of the architecture work touches it.

@@ -90,7 +90,7 @@ Check the count before moving on. Aim for **300–500 of your own frames**.
 python training/prelabel.py
 ```
 
-Runs `yolo11x` over every image and writes the `person` and `phone` boxes, so you
+Runs `yolo26x` over every image and writes the `person` and `phone` boxes, so you
 only draw heads and helmets by hand. It **never overwrites an existing label
 file**, so it cannot destroy your work — safe to re-run after adding more images.
 
@@ -99,13 +99,13 @@ expensive mistake (see below). Accuracy beats speed here.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--model` | `yolo11x.pt` | Which COCO model does the labelling. Big is right here — it runs once and its misses become your manual work. Downloads automatically (~110 MB) |
+| `--model` | `yolo26x.pt` | Which COCO model does the labelling. Big is right here — it runs once and its misses become your manual work. Downloads automatically (~110 MB) |
 | `--imgsz` | 1280 | Detection resolution. Match your deployment so small phones are found |
 | `--conf` | 0.25 | Deliberately low. A **missed** object becomes background and teaches the wrong thing; deleting a wrong box in the editor takes a second, spotting a missing one does not |
 | `--images` | `dataset/images/train` | Which folder to label — point it at `val` too if you split first |
 | `--overwrite` | off | Re-label images that already have a label file. **Leave this off** — it is what stops the tool destroying your hand-drawn helmets |
 
-On a CPU-only machine, `--model module/models/yolo11n.pt --imgsz 640` finishes in
+On a CPU-only machine, `--model module/models/yolo26n.pt --imgsz 640` finishes in
 reasonable time, but expect noticeably more to fix by hand.
 
 ### 4. Label heads and helmets — the human part
@@ -187,14 +187,14 @@ no labels yet.
 ### 6. Train
 
 ```bash
-python training/train.py                        # 100 epochs from yolo11n.pt
+python training/train.py                        # 100 epochs from yolo26n.pt
 python training/train.py --batch 4              # if CUDA runs out of memory
-python training/train.py --epochs 200 --model yolo11s.pt
+python training/train.py --epochs 200 --model yolo26s.pt
 ```
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--model` | `yolo11n.pt` | Starting weights. Fine-tuning from the COCO checkpoint beats training from scratch on a small dataset. `yolo11s.pt` is more accurate but slower at runtime, on every camera, forever |
+| `--model` | `yolo26n.pt` | Starting weights. Fine-tuning from the COCO checkpoint beats training from scratch on a small dataset. `yolo26s.pt` is more accurate but slower at runtime, on every camera, forever |
 | `--epochs` | 100 | Passes over the dataset. Training stops early if it stops improving for 30 (`patience`) |
 | `--imgsz` | 0 → 1280 | 0 means "take it from `Config.inference_imgsz`". **Keep training and deployment equal** — train at 640 and deploy at 1280 and the model sees objects at a scale it never learned |
 | `--batch` | 8 | Images per step. **Lower this first** if training dies with CUDA out-of-memory at 1280 |

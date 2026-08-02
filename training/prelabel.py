@@ -13,7 +13,7 @@ new model that people are not people. That is why the confidence default is low
 one takes real attention.
 
     python training/prelabel.py                          # label the train split
-    python training/prelabel.py --model module/models/yolo11n.pt
+    python training/prelabel.py --model module/models/yolo26n.pt
     python training/prelabel.py --images training/dataset/images/val
 
 Then load the folder in an editor (CVAT, Label Studio, Roboflow — all read this
@@ -50,10 +50,10 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--images", type=Path,
                     default=ROOT / "training" / "dataset" / "images" / "train")
-    ap.add_argument("--model", type=str, default="yolo11x.pt",
+    ap.add_argument("--model", type=str, default="yolo26x.pt",
                     help="COCO model used for labelling. Bigger = better labels; "
                          "this runs once offline, so accuracy beats speed "
-                         "(default yolo11x.pt, auto-downloaded)")
+                         "(default yolo26x.pt, auto-downloaded)")
     ap.add_argument("--imgsz", type=int, default=1280,
                     help="match your deployment imgsz so small phones are found")
     ap.add_argument("--conf", type=float, default=0.25,

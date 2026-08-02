@@ -32,7 +32,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
 ```
 
 `ffmpeg`/libav comes bundled with PyAV; no system ffmpeg needed. The model weight
-(`module/models/yolo11n.pt`) is downloaded by ultralytics on first use if absent.
+(`module/models/yolo26n.pt`) is downloaded by ultralytics on first use if absent.
 
 ## Configure
 

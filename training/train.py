@@ -10,8 +10,8 @@ actually needs and checks the two things people get wrong:
   infers a violation from a MISSING helmet, so every helmet the model fails to
   detect is a false accusation against a compliant worker.
 
-    python training/train.py                      # 100 epochs from yolo11n.pt
-    python training/train.py --epochs 200 --model yolo11s.pt
+    python training/train.py                      # 100 epochs from yolo26n.pt
+    python training/train.py --epochs 200 --model yolo26s.pt
     python training/train.py --batch 4            # if you hit CUDA OOM at 1280
 """
 from __future__ import annotations
@@ -89,9 +89,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", type=Path, default=ROOT / "training" / "ppe.yaml")
-    ap.add_argument("--model", type=str, default="yolo11n.pt",
+    ap.add_argument("--model", type=str, default="yolo26n.pt",
                     help="starting weights. Fine-tuning from the COCO checkpoint "
-                         "beats training from scratch on a small dataset")
+                         "beats training from scratch on a small dataset. Keep "
+                         "this the same family as Config.model_path")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--imgsz", type=int, default=0,
                     help="0 = take it from Config.inference_imgsz (recommended)")

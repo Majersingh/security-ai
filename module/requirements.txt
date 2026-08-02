@@ -6,7 +6,9 @@
 # Keeping them apart is what lets central deploy anywhere, without a GPU.
 
 # --- AI / CV stack ---
-ultralytics>=8.3.0        # YOLOv11 detection + built-in ByteTrack tracking
+# 8.4.0 is a HARD floor, not a preference: yolo26*.pt ships in the v8.4.0 asset
+# release, so on 8.3.x the auto-download of Config.model_path fails outright.
+ultralytics>=8.4.0        # YOLO26 detection + built-in ByteTrack tracking
 lap>=0.5.12               # linear assignment, required by the built-in tracker
 supervision>=0.25,<0.30   # Detections container + annotators (ByteTrack removed in 0.30)
 opencv-python>=4.10.0     # drawing / image ops

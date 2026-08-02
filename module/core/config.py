@@ -30,7 +30,12 @@ class Config:
     # video at all. Snapshots and the events CSV are the only artefacts.
     events_csv: Path = ROOT_DIR / "output" / "events.csv"
     snapshots_dir: Path = ROOT_DIR / "output" / "snapshots"
-    model_path: Path = ROOT_DIR / "models" / "yolo11n.pt"
+    # yolo26n over yolo11n: same COCO 80 classes and the same person/phone
+    # accuracy, but NMS-free. That removes the ~2 ms/image postprocess, which is
+    # per-frame CPU work that scales with feed count — the cheapest capacity win
+    # available. Re-run tests/bench_gpu.py after changing this: fps_budget below
+    # is calibrated to whatever model is named here.
+    model_path: Path = ROOT_DIR / "models" / "yolo26n.pt"
 
     # ------------------------------------------------------------------ model
     # COCO class ids: 0 = person, 67 = cell phone. We ignore all other classes.

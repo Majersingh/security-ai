@@ -83,8 +83,8 @@ pip install -r central/requirements.txt    # central: fastapi + uvicorn only
 ```
 
 The two share nothing on purpose — central has no torch, no CUDA, no OpenCV, so it
-deploys as a small container anywhere. The module installs Ultralytics (YOLOv11),
-Supervision (ByteTrack + annotators), OpenCV, PyAV, NumPy and Pandas. The YOLOv11
+deploys as a small container anywhere. The module installs Ultralytics (YOLO26),
+Supervision (ByteTrack + annotators), OpenCV, PyAV, NumPy and Pandas. The YOLO26
 weight is downloaded on first run and cached in `module/models/`.
 
 Install a **CUDA build of torch** for the module; the default wheel is CPU-only and
@@ -157,7 +157,7 @@ security-ai/
   module/           app.py, reporting.py, static/
                     core/     the CV pipeline (config, feeds, inference, sources,
                               streaming, behavior, tracker, events, workers, utils)
-                    models/   yolo11n.pt        (auto-downloaded)
+                    models/   yolo26n.pt        (auto-downloaded)
                     output/   <feed_id>/{events.csv, snapshots/}
                     SETUP.md, .env.example, requirements.txt
   streamer/         video-only deployable (no GPU, no torch)
@@ -251,7 +251,7 @@ Any rule may now declare its own debounce timescale via `BehaviorRule.start_seco
 ## PPE: helmet compliance
 
 **Off by default, because it needs a model you have to train.** COCO has no
-helmet class, so `yolo11n.pt` can never fire this rule. Enable it only once
+helmet class, so `yolo26n.pt` can never fire this rule. Enable it only once
 `model_path` points at a PPE-trained model, then set `ppe_enabled = True` and
 `helmet_class_id` to that model's helmet class id.
 
@@ -383,8 +383,8 @@ each stream's real FPS, so "1 second of phone use" means 1 real second across
   sampled frames. `inference_imgsz` therefore defaults to `1280` (the server
   uses `640` for live streams, where subjects are closer). Raise it if phones
   are missed.
-- **Model size.** `yolo11n` (nano) is the fastest and auto-downloaded default.
-  For better small-object recall set `model_path` to `yolo11s`/`yolo11m` in
+- **Model size.** `yolo26n` (nano) is the fastest and auto-downloaded default.
+  For better small-object recall set `model_path` to `yolo26s`/`yolo26m` in
   `config.py` (Ultralytics downloads it automatically).
 - **Confidence / thresholds.** `confidence_threshold`, `violation_start_seconds`
   and the proximity values in `config.py` trade sensitivity against false positives.
