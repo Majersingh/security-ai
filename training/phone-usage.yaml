@@ -1,6 +1,6 @@
 
 path: .
-train: /phone-usage-data
+train: phone-usage-data/images
 val: dataset/images/val
 
 names:
