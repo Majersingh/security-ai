@@ -1,0 +1,9 @@
+
+path: .
+train: /phone-usage-data
+val: dataset/images/val
+
+names:
+  0: person
+  1: helmet
+  2: phone
